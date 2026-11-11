@@ -5,18 +5,18 @@ use egui_extras::{Column, TableBuilder};
 use regex::RegexBuilder;
 use std::collections::HashSet;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_title("ReStem — Пакетное переименование")
-            .with_inner_size([1050.0, 700.0])
-            .with_min_inner_size([850.0, 520.0]),
+            .with_title("ReStem — Пакетное переименование файлов и папок")
+            .with_inner_size([1150.0, 720.0])
+            .with_min_inner_size([900.0, 540.0]),
         ..Default::default()
     };
     eframe::run_native(
-        "ReStem — Пакетное переименование",
+        "ReStem — Пакетное переименование файлов и папок",
         options,
         Box::new(|_cc| Ok(Box::new(ReStemApp::default()))),
     )
@@ -38,8 +38,22 @@ enum NumMode {
     Prefix,
 }
 
+#[derive(Clone)]
+struct FsEntry {
+    path: PathBuf,
+    parent_dir: PathBuf,
+    rel_parent: String,
+    is_dir: bool,
+    depth: usize,
+}
+
+#[derive(Clone)]
 struct PreviewRow {
     old_path: PathBuf,
+    parent_dir: PathBuf,
+    rel_parent: String,
+    is_dir: bool,
+    depth: usize,
     old_name: String,
     new_name: String,
     changed: bool,
@@ -47,27 +61,36 @@ struct PreviewRow {
 
 struct ReStemApp {
     current_dir: Option<PathBuf>,
-    all_files: Vec<PathBuf>,
+    all_entries: Vec<FsEntry>,
     preview_rows: Vec<PreviewRow>,
     undo_history: Vec<(PathBuf, PathBuf)>,
 
+    // Настройки выбора объектов
+    include_files: bool,
+    include_dirs: bool,
+    recursive: bool,
     ext_filter: String,
+
+    // 1. Поиск и замена
     find_str: String,
     replace_str: String,
     use_regex: bool,
     case_sensitive: bool,
 
+    // 2. Добавление и обрезка
     prefix: String,
     suffix: String,
     trim_start: usize,
     trim_end: usize,
 
+    // 3. Регистр и нумерация
     case_mode: CaseMode,
     num_mode: NumMode,
     num_start: usize,
     num_step: usize,
     num_pad: usize,
     num_sep: String,
+    reset_num_per_dir: bool,
 
     status_msg: String,
 }
@@ -76,9 +99,12 @@ impl Default for ReStemApp {
     fn default() -> Self {
         Self {
             current_dir: None,
-            all_files: Vec::new(),
+            all_entries: Vec::new(),
             preview_rows: Vec::new(),
             undo_history: Vec::new(),
+            include_files: true,
+            include_dirs: true,
+            recursive: false,
             ext_filter: String::new(),
             find_str: String::new(),
             replace_str: String::new(),
@@ -94,43 +120,119 @@ impl Default for ReStemApp {
             num_step: 1,
             num_pad: 2,
             num_sep: "_".to_string(),
-            status_msg: "ReStem готов к работе. Выберите папку с файлами.".to_string(),
+            reset_num_per_dir: true,
+            status_msg: "ReStem готов к работе. Выберите корневую папку.".to_string(),
         }
     }
 }
 
 impl ReStemApp {
-    fn load_directory(&mut self, dir: PathBuf) {
-        let mut files = Vec::new();
-        if let Ok(entries) = fs::read_dir(&dir) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.is_file() {
-                    files.push(path);
-                }
-            }
-        }
-        files.sort_by_key(|p| {
+    fn load_directory(&mut self, root_dir: PathBuf) {
+        let mut entries = Vec::new();
+        self.collect_entries(&root_dir, &root_dir, 0, &mut entries);
+
+        entries.sort_by(|a, b| {
+            a.rel_parent
+                .to_lowercase()
+                .cmp(&b.rel_parent.to_lowercase())
+                .then_with(|| b.is_dir.cmp(&a.is_dir))
+                .then_with(|| {
+                    a.path
+                        .file_name()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                        .to_lowercase()
+                        .cmp(
+                            &b.path
+                                .file_name()
+                                .unwrap_or_default()
+                                .to_string_lossy()
+                                .to_lowercase(),
+                        )
+                })
+        });
+
+        self.current_dir = Some(root_dir);
+        self.all_entries = entries;
+        self.recalculate_preview();
+    }
+
+    fn collect_entries(
+        &self,
+        root: &Path,
+        current: &Path,
+        depth: usize,
+        out: &mut Vec<FsEntry>,
+    ) {
+        let Ok(read_dir) = fs::read_dir(current) else {
+            return;
+        };
+
+        let mut local_entries: Vec<PathBuf> = read_dir
+            .flatten()
+            .map(|e| e.path())
+            .collect();
+
+        local_entries.sort_by_key(|p| {
             p.file_name()
                 .unwrap_or_default()
                 .to_string_lossy()
                 .to_lowercase()
         });
-        self.current_dir = Some(dir);
-        self.all_files = files;
-        self.recalculate_preview();
+
+        for path in local_entries {
+            let is_dir = path.is_dir();
+            let parent_dir = path.parent().unwrap_or(root).to_path_buf();
+            let rel_parent = parent_dir
+                .strip_prefix(root)
+                .ok()
+                .map(|p| p.display().to_string())
+                .unwrap_or_default();
+
+            let rel_display = if rel_parent.is_empty() {
+                ".".to_string()
+            } else {
+                rel_parent
+            };
+
+            out.push(FsEntry {
+                path: path.clone(),
+                parent_dir,
+                rel_parent: rel_display,
+                is_dir,
+                depth,
+            });
+
+            if is_dir && self.recursive {
+                self.collect_entries(root, &path, depth + 1, out);
+            }
+        }
     }
 
-    fn compute_new_name(&self, path: &PathBuf, idx: usize) -> String {
-        let mut stem = path
-            .file_stem()
-            .unwrap_or_default()
-            .to_string_lossy()
-            .to_string();
-        let ext = path
-            .extension()
-            .map(|e| format!(".{}", e.to_string_lossy()))
-            .unwrap_or_default();
+    fn compute_new_name(&self, entry: &FsEntry, idx: usize) -> String {
+        let (mut stem, ext) = if entry.is_dir {
+            // Для папок точки в названии не считаются расширением файла
+            let full_name = entry
+                .path
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_string();
+            (full_name, String::new())
+        } else {
+            let s = entry
+                .path
+                .file_stem()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_string();
+            let e = entry
+                .path
+                .extension()
+                .map(|ext_os| format!(".{}", ext_os.to_string_lossy()))
+                .unwrap_or_default();
+            (s, e)
+        };
 
         // 1. Обрезка символов по краям (посимвольно с поддержкой UTF-8)
         let chars: Vec<char> = stem.chars().collect();
@@ -205,38 +307,65 @@ impl ReStemApp {
             .filter(|s| !s.is_empty())
             .collect();
 
-        let filtered: Vec<&PathBuf> = self
-            .all_files
+        let filtered: Vec<&FsEntry> = self
+            .all_entries
             .iter()
-            .filter(|p| {
-                if allowed_exts.is_empty() {
-                    return true;
+            .filter(|e| {
+                if e.is_dir && !self.include_dirs {
+                    return false;
                 }
-                let ext = p
-                    .extension()
-                    .unwrap_or_default()
-                    .to_string_lossy()
-                    .to_lowercase();
-                allowed_exts.contains(&ext)
+                if !e.is_dir && !self.include_files {
+                    return false;
+                }
+                if !allowed_exts.is_empty() {
+                    if e.is_dir {
+                        return false;
+                    }
+                    let ext = e
+                        .path
+                        .extension()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                        .to_lowercase();
+                    return allowed_exts.contains(&ext);
+                }
+                true
             })
             .collect();
 
         self.preview_rows.clear();
         let mut changed_count = 0;
+        let mut last_parent: Option<PathBuf> = None;
+        let mut counter_idx = 0;
 
-        for (idx, path) in filtered.into_iter().enumerate() {
-            let old_name = path
+        for entry in filtered {
+            if self.reset_num_per_dir {
+                if last_parent.as_ref() != Some(&entry.parent_dir) {
+                    counter_idx = 0;
+                    last_parent = Some(entry.parent_dir.clone());
+                }
+            }
+
+            let old_name = entry
+                .path
                 .file_name()
                 .unwrap_or_default()
                 .to_string_lossy()
                 .to_string();
-            let new_name = self.compute_new_name(path, idx);
-            let changed = old_name != new_name;
+            let new_name = self.compute_new_name(entry, counter_idx);
+            counter_idx += 1;
+
+            let changed = old_name != new_name && !new_name.is_empty();
             if changed {
                 changed_count += 1;
             }
+
             self.preview_rows.push(PreviewRow {
-                old_path: path.clone(),
+                old_path: entry.path.clone(),
+                parent_dir: entry.parent_dir.clone(),
+                rel_parent: entry.rel_parent.clone(),
+                is_dir: entry.is_dir,
+                depth: entry.depth,
                 old_name,
                 new_name,
                 changed,
@@ -244,7 +373,7 @@ impl ReStemApp {
         }
 
         self.status_msg = format!(
-            "Файлов в списке: {} | Будет переименовано: {}",
+            "Объектов в списке: {} | Будет переименовано: {}",
             self.preview_rows.len(),
             changed_count
         );
@@ -269,25 +398,52 @@ impl ReStemApp {
     }
 
     fn apply_rename(&mut self) {
-        let mut seen = HashSet::new();
+        // Проверка дубликатов внутри одной и той же родительской папки
+        let mut seen: HashSet<(PathBuf, String)> = HashSet::new();
         for row in &self.preview_rows {
-            let lower = row.new_name.to_lowercase();
-            if !seen.insert(lower) {
-                self.status_msg = format!("Ошибка: дубликат имени '{}'", row.new_name);
+            let key = (row.parent_dir.clone(), row.new_name.to_lowercase());
+            if !seen.insert(key) {
+                self.status_msg = format!(
+                    "Ошибка: конфликт имени '{}' в папке '{}'",
+                    row.new_name, row.rel_parent
+                );
                 return;
             }
         }
 
+        // Собираем только изменяемые элементы и сортируем снизу вверх (от глубоких к корню)
+        let mut to_rename: Vec<PreviewRow> = self
+            .preview_rows
+            .iter()
+            .filter(|r| r.changed)
+            .cloned()
+            .collect();
+
+        to_rename.sort_by(|a, b| {
+            b.depth
+                .cmp(&a.depth)
+                .then_with(|| a.is_dir.cmp(&b.is_dir))
+        });
+
         let mut history = Vec::new();
-        for row in &self.preview_rows {
-            if row.changed {
-                let new_path = row.old_path.with_file_name(&row.new_name);
-                if let Err(e) = fs::rename(&row.old_path, &new_path) {
-                    self.status_msg = format!("Ошибка переименования {}: {}", row.old_name, e);
-                    break;
-                }
-                history.push((new_path, row.old_path.clone()));
+        for row in to_rename {
+            let new_path = row.old_path.with_file_name(&row.new_name);
+            let same_file_case_change =
+                row.old_name.to_lowercase() == row.new_name.to_lowercase();
+
+            if new_path.exists() && !same_file_case_change {
+                self.status_msg = format!(
+                    "Ошибка: '{}' уже существует в '{}'",
+                    row.new_name, row.rel_parent
+                );
+                break;
             }
+
+            if let Err(e) = fs::rename(&row.old_path, &new_path) {
+                self.status_msg = format!("Ошибка переименования {}: {}", row.old_name, e);
+                break;
+            }
+            history.push((new_path, row.old_path));
         }
 
         let count = history.len();
@@ -295,11 +451,12 @@ impl ReStemApp {
         if let Some(dir) = self.current_dir.clone() {
             self.load_directory(dir);
         }
-        self.status_msg = format!("Успешно переименовано файлов: {}", count);
+        self.status_msg = format!("Успешно переименовано объектов: {}", count);
     }
 
     fn undo_rename(&mut self) {
         let mut restored = 0;
+        // Откат выполняется в обратном порядке (сверху вниз: от родительских папок к вложенным файлам)
         for (curr, orig) in self.undo_history.drain(..).rev() {
             if fs::rename(&curr, &orig).is_ok() {
                 restored += 1;
@@ -315,13 +472,15 @@ impl ReStemApp {
 impl eframe::App for ReStemApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         let mut needs_recalc = false;
+        let mut needs_reload = false;
 
         egui::TopBottomPanel::top("top_panel").show(ctx, |ui| {
             ui.add_space(4.0);
             ui.horizontal(|ui| {
                 if ui.button("Обзор папки...").clicked() {
                     if let Some(folder) = rfd::FileDialog::new().pick_folder() {
-                        self.load_directory(folder);
+                        self.current_dir = Some(folder);
+                        needs_reload = true;
                     }
                 }
                 let dir_text = self
@@ -330,6 +489,20 @@ impl eframe::App for ReStemApp {
                     .map(|p| p.display().to_string())
                     .unwrap_or_else(|| "Папка не выбрана".to_string());
                 ui.label(dir_text);
+            });
+
+            ui.separator();
+
+            ui.horizontal(|ui| {
+                ui.strong("Объекты:");
+                needs_recalc |= ui.checkbox(&mut self.include_files, "Файлы").changed();
+                needs_recalc |= ui.checkbox(&mut self.include_dirs, "Папки").changed();
+                if ui
+                    .checkbox(&mut self.recursive, "Вложенные (рекурсивно)")
+                    .changed()
+                {
+                    needs_reload = true;
+                }
 
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui
@@ -338,10 +511,10 @@ impl eframe::App for ReStemApp {
                     {
                         needs_recalc = true;
                     }
-                    ui.label("Фильтр расширений (jpg, png):");
+                    ui.label("Фильтр расширений файлов (jpg, png):");
                 });
             });
-            ui.add_space(4.0);
+            ui.add_space(2.0);
         });
 
         egui::TopBottomPanel::bottom("bottom_panel").show(ctx, |ui| {
@@ -349,11 +522,14 @@ impl eframe::App for ReStemApp {
             ui.horizontal(|ui| {
                 ui.label(&self.status_msg);
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.button("Переименовать файлы").clicked() {
+                    if ui.button("Переименовать").clicked() {
                         self.apply_rename();
                     }
                     if ui
-                        .add_enabled(!self.undo_history.is_empty(), egui::Button::new("Undo (Откат)"))
+                        .add_enabled(
+                            !self.undo_history.is_empty(),
+                            egui::Button::new("Undo (Откат)"),
+                        )
                         .clicked()
                     {
                         self.undo_rename();
@@ -378,8 +554,12 @@ impl eframe::App for ReStemApp {
                         needs_recalc |= ui.text_edit_singleline(&mut self.replace_str).changed();
                         ui.end_row();
                     });
-                    needs_recalc |= ui.checkbox(&mut self.use_regex, "Регулярные выражения (Regex)").changed();
-                    needs_recalc |= ui.checkbox(&mut self.case_sensitive, "Учитывать регистр").changed();
+                    needs_recalc |= ui
+                        .checkbox(&mut self.use_regex, "Регулярные выражения (Regex)")
+                        .changed();
+                    needs_recalc |= ui
+                        .checkbox(&mut self.case_sensitive, "Учитывать регистр")
+                        .changed();
                 });
 
                 cols[1].group(|ui| {
@@ -392,10 +572,14 @@ impl eframe::App for ReStemApp {
                         needs_recalc |= ui.text_edit_singleline(&mut self.suffix).changed();
                         ui.end_row();
                         ui.label("Удалить слева:");
-                        needs_recalc |= ui.add(egui::DragValue::new(&mut self.trim_start).range(0..=100)).changed();
+                        needs_recalc |= ui
+                            .add(egui::DragValue::new(&mut self.trim_start).range(0..=100))
+                            .changed();
                         ui.end_row();
                         ui.label("Удалить справа:");
-                        needs_recalc |= ui.add(egui::DragValue::new(&mut self.trim_end).range(0..=100)).changed();
+                        needs_recalc |= ui
+                            .add(egui::DragValue::new(&mut self.trim_end).range(0..=100))
+                            .changed();
                         ui.end_row();
                     });
                 });
@@ -413,11 +597,29 @@ impl eframe::App for ReStemApp {
                                 CaseMode::Title => "Каждое Слово",
                             })
                             .show_ui(ui, |ui| {
-                                needs_recalc |= ui.selectable_value(&mut self.case_mode, CaseMode::None, "Не менять").changed();
-                                needs_recalc |= ui.selectable_value(&mut self.case_mode, CaseMode::Lower, "строчные").changed();
-                                needs_recalc |= ui.selectable_value(&mut self.case_mode, CaseMode::Upper, "ПРОПИСНЫЕ").changed();
-                                needs_recalc |= ui.selectable_value(&mut self.case_mode, CaseMode::Capitalize, "Первая заглавная").changed();
-                                needs_recalc |= ui.selectable_value(&mut self.case_mode, CaseMode::Title, "Каждое Слово").changed();
+                                needs_recalc |= ui
+                                    .selectable_value(&mut self.case_mode, CaseMode::None, "Не менять")
+                                    .changed();
+                                needs_recalc |= ui
+                                    .selectable_value(&mut self.case_mode, CaseMode::Lower, "строчные")
+                                    .changed();
+                                needs_recalc |= ui
+                                    .selectable_value(&mut self.case_mode, CaseMode::Upper, "ПРОПИСНЫЕ")
+                                    .changed();
+                                needs_recalc |= ui
+                                    .selectable_value(
+                                        &mut self.case_mode,
+                                        CaseMode::Capitalize,
+                                        "Первая заглавная",
+                                    )
+                                    .changed();
+                                needs_recalc |= ui
+                                    .selectable_value(
+                                        &mut self.case_mode,
+                                        CaseMode::Title,
+                                        "Каждое Слово",
+                                    )
+                                    .changed();
                             });
                     });
 
@@ -430,28 +632,48 @@ impl eframe::App for ReStemApp {
                                 NumMode::Prefix => "В начало",
                             })
                             .show_ui(ui, |ui| {
-                                needs_recalc |= ui.selectable_value(&mut self.num_mode, NumMode::None, "Нет").changed();
-                                needs_recalc |= ui.selectable_value(&mut self.num_mode, NumMode::Suffix, "В конец").changed();
-                                needs_recalc |= ui.selectable_value(&mut self.num_mode, NumMode::Prefix, "В начало").changed();
+                                needs_recalc |= ui
+                                    .selectable_value(&mut self.num_mode, NumMode::None, "Нет")
+                                    .changed();
+                                needs_recalc |= ui
+                                    .selectable_value(&mut self.num_mode, NumMode::Suffix, "В конец")
+                                    .changed();
+                                needs_recalc |= ui
+                                    .selectable_value(&mut self.num_mode, NumMode::Prefix, "В начало")
+                                    .changed();
                             });
                     });
 
                     ui.horizontal(|ui| {
                         ui.label("Старт:");
-                        needs_recalc |= ui.add(egui::DragValue::new(&mut self.num_start).range(0..=99999)).changed();
+                        needs_recalc |= ui
+                            .add(egui::DragValue::new(&mut self.num_start).range(0..=99999))
+                            .changed();
                         ui.label("Шаг:");
-                        needs_recalc |= ui.add(egui::DragValue::new(&mut self.num_step).range(1..=1000)).changed();
-                    });
-                    ui.horizontal(|ui| {
+                        needs_recalc |= ui
+                            .add(egui::DragValue::new(&mut self.num_step).range(1..=1000))
+                            .changed();
                         ui.label("Нулей:");
-                        needs_recalc |= ui.add(egui::DragValue::new(&mut self.num_pad).range(1..=10)).changed();
+                        needs_recalc |= ui
+                            .add(egui::DragValue::new(&mut self.num_pad).range(1..=10))
+                            .changed();
                         ui.label("Раздел.:");
-                        needs_recalc |= ui.add(egui::TextEdit::singleline(&mut self.num_sep).desired_width(40.0)).changed();
+                        needs_recalc |= ui
+                            .add(egui::TextEdit::singleline(&mut self.num_sep).desired_width(30.0))
+                            .changed();
                     });
+
+                    needs_recalc |= ui
+                        .checkbox(&mut self.reset_num_per_dir, "Сброс счётчика в каждой папке")
+                        .changed();
                 });
             });
 
-            if needs_recalc {
+            if needs_reload {
+                if let Some(dir) = self.current_dir.clone() {
+                    self.load_directory(dir);
+                }
+            } else if needs_recalc {
                 self.recalculate_preview();
             }
 
@@ -461,21 +683,50 @@ impl eframe::App for ReStemApp {
                 .striped(true)
                 .resizable(true)
                 .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
-                .column(Column::initial(380.0).resizable(true))
-                .column(Column::initial(380.0).resizable(true))
+                .column(Column::initial(70.0).resizable(true))
+                .column(Column::initial(220.0).resizable(true))
+                .column(Column::initial(320.0).resizable(true))
+                .column(Column::initial(320.0).resizable(true))
                 .column(Column::remainder())
                 .header(22.0, |mut header| {
-                    header.col(|ui| { ui.strong("Текущее имя файла"); });
-                    header.col(|ui| { ui.strong("Новое имя (предпросмотр)"); });
-                    header.col(|ui| { ui.strong("Статус"); });
+                    header.col(|ui| {
+                        ui.strong("Тип");
+                    });
+                    header.col(|ui| {
+                        ui.strong("Расположение");
+                    });
+                    header.col(|ui| {
+                        ui.strong("Текущее имя");
+                    });
+                    header.col(|ui| {
+                        ui.strong("Новое имя (предпросмотр)");
+                    });
+                    header.col(|ui| {
+                        ui.strong("Статус");
+                    });
                 })
                 .body(|body| {
                     body.rows(20.0, self.preview_rows.len(), |mut row| {
                         let item = &self.preview_rows[row.index()];
-                        row.col(|ui| { ui.label(&item.old_name); });
+                        row.col(|ui| {
+                            if item.is_dir {
+                                ui.colored_label(egui::Color32::from_rgb(230, 160, 40), "[Папка]");
+                            } else {
+                                ui.label("Файл");
+                            }
+                        });
+                        row.col(|ui| {
+                            ui.label(&item.rel_parent);
+                        });
+                        row.col(|ui| {
+                            ui.label(&item.old_name);
+                        });
                         row.col(|ui| {
                             if item.changed {
-                                ui.colored_label(egui::Color32::from_rgb(40, 180, 99), &item.new_name);
+                                ui.colored_label(
+                                    egui::Color32::from_rgb(40, 180, 99),
+                                    &item.new_name,
+                                );
                             } else {
                                 ui.label(&item.new_name);
                             }
