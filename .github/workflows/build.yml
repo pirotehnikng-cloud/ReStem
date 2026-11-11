@@ -4,6 +4,9 @@ on:
   push:
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
   build-windows:
     runs-on: windows-latest
@@ -20,8 +23,10 @@ jobs:
       - name: Build optimized ReStem EXE
         run: cargo build --release
 
-      - name: Upload compiled EXE
-        uses: actions/upload-artifact@v5
-        with:
-          name: ReStem-Portable
-          path: target/release/restem.exe
+      - name: Publish EXE to GitHub Releases
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release upload v1.0.0 target/release/restem.exe --clobber || \
+          gh release create v1.0.0 target/release/restem.exe --title "ReStem v1.0.0" --notes "Автономная сборка ReStem для Windows (x64)"
