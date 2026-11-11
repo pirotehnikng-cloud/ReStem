@@ -11,8 +11,9 @@ fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("ReStem — Пакетное переименование файлов и папок")
-            .with_inner_size([1150.0, 720.0])
-            .with_min_inner_size([900.0, 540.0]),
+            .with_inner_size([1180.0, 720.0])
+            .with_min_inner_size([920.0, 540.0])
+            .with_drag_and_drop(true),
         ..Default::default()
     };
     eframe::run_native(
@@ -56,6 +57,7 @@ struct PreviewRow {
     depth: usize,
     old_name: String,
     new_name: String,
+    included: bool,
     changed: bool,
 }
 
@@ -63,6 +65,7 @@ struct ReStemApp {
     current_dir: Option<PathBuf>,
     all_entries: Vec<FsEntry>,
     preview_rows: Vec<PreviewRow>,
+    excluded_paths: HashSet<PathBuf>,
     undo_history: Vec<(PathBuf, PathBuf)>,
 
     // Настройки выбора объектов
@@ -101,6 +104,7 @@ impl Default for ReStemApp {
             current_dir: None,
             all_entries: Vec::new(),
             preview_rows: Vec::new(),
+            excluded_paths: HashSet::new(),
             undo_history: Vec::new(),
             include_files: true,
             include_dirs: true,
@@ -121,12 +125,20 @@ impl Default for ReStemApp {
             num_pad: 2,
             num_sep: "_".to_string(),
             reset_num_per_dir: true,
-            status_msg: "ReStem готов к работе. Выберите корневую папку.".to_string(),
+            status_msg: "Выберите папку кнопкой «Обзор» или перетащите её мышью в это окно."
+                .to_string(),
         }
     }
 }
 
 impl ReStemApp {
+    fn open_new_directory(&mut self, root_dir: PathBuf) {
+        if self.current_dir.as_ref() != Some(&root_dir) {
+            self.excluded_paths.clear();
+        }
+        self.load_directory(root_dir);
+    }
+
     fn load_directory(&mut self, root_dir: PathBuf) {
         let mut entries = Vec::new();
         self.collect_entries(&root_dir, &root_dir, 0, &mut entries);
@@ -168,10 +180,7 @@ impl ReStemApp {
             return;
         };
 
-        let mut local_entries: Vec<PathBuf> = read_dir
-            .flatten()
-            .map(|e| e.path())
-            .collect();
+        let mut local_entries: Vec<PathBuf> = read_dir.flatten().map(|e| e.path()).collect();
 
         local_entries.sort_by_key(|p| {
             p.file_name()
@@ -211,7 +220,6 @@ impl ReStemApp {
 
     fn compute_new_name(&self, entry: &FsEntry, idx: usize) -> String {
         let (mut stem, ext) = if entry.is_dir {
-            // Для папок точки в названии не считаются расширением файла
             let full_name = entry
                 .path
                 .file_name()
@@ -335,6 +343,7 @@ impl ReStemApp {
 
         self.preview_rows.clear();
         let mut changed_count = 0;
+        let mut included_count = 0;
         let mut last_parent: Option<PathBuf> = None;
         let mut counter_idx = 0;
 
@@ -352,10 +361,18 @@ impl ReStemApp {
                 .unwrap_or_default()
                 .to_string_lossy()
                 .to_string();
-            let new_name = self.compute_new_name(entry, counter_idx);
-            counter_idx += 1;
 
-            let changed = old_name != new_name && !new_name.is_empty();
+            let included = !self.excluded_paths.contains(&entry.path);
+            let new_name = if included {
+                included_count += 1;
+                let computed = self.compute_new_name(entry, counter_idx);
+                counter_idx += 1;
+                computed
+            } else {
+                old_name.clone()
+            };
+
+            let changed = included && old_name != new_name && !new_name.is_empty();
             if changed {
                 changed_count += 1;
             }
@@ -368,13 +385,15 @@ impl ReStemApp {
                 depth: entry.depth,
                 old_name,
                 new_name,
+                included,
                 changed,
             });
         }
 
         self.status_msg = format!(
-            "Объектов в списке: {} | Будет переименовано: {}",
+            "Всего в списке: {} | Выбрано галочками: {} | Будет переименовано: {}",
             self.preview_rows.len(),
+            included_count,
             changed_count
         );
     }
@@ -398,24 +417,28 @@ impl ReStemApp {
     }
 
     fn apply_rename(&mut self) {
-        // Проверка дубликатов внутри одной и той же родительской папки
+        // Проверяем конфликты имён с учётом как переименовываемых, так и пропущенных файлов
         let mut seen: HashSet<(PathBuf, String)> = HashSet::new();
         for row in &self.preview_rows {
-            let key = (row.parent_dir.clone(), row.new_name.to_lowercase());
+            let final_name = if row.included {
+                &row.new_name
+            } else {
+                &row.old_name
+            };
+            let key = (row.parent_dir.clone(), final_name.to_lowercase());
             if !seen.insert(key) {
                 self.status_msg = format!(
                     "Ошибка: конфликт имени '{}' в папке '{}'",
-                    row.new_name, row.rel_parent
+                    final_name, row.rel_parent
                 );
                 return;
             }
         }
 
-        // Собираем только изменяемые элементы и сортируем снизу вверх (от глубоких к корню)
         let mut to_rename: Vec<PreviewRow> = self
             .preview_rows
             .iter()
-            .filter(|r| r.changed)
+            .filter(|r| r.included && r.changed)
             .cloned()
             .collect();
 
@@ -456,7 +479,6 @@ impl ReStemApp {
 
     fn undo_rename(&mut self) {
         let mut restored = 0;
-        // Откат выполняется в обратном порядке (сверху вниз: от родительских папок к вложенным файлам)
         for (curr, orig) in self.undo_history.drain(..).rev() {
             if fs::rename(&curr, &orig).is_ok() {
                 restored += 1;
@@ -467,10 +489,46 @@ impl ReStemApp {
         }
         self.status_msg = format!("Откат выполнен: возвращено {} имён", restored);
     }
+
+    fn handle_drag_and_drop(&mut self, ctx: &egui::Context) {
+        let dropped_files = ctx.input(|i| i.raw.dropped_files.clone());
+        if !dropped_files.is_empty() {
+            if let Some(dropped_path) = dropped_files.into_iter().find_map(|f| f.path) {
+                let target_dir = if dropped_path.is_dir() {
+                    Some(dropped_path)
+                } else {
+                    dropped_path.parent().map(|p| p.to_path_buf())
+                };
+
+                if let Some(dir) = target_dir {
+                    self.open_new_directory(dir);
+                }
+            }
+        }
+
+        let is_hovering = ctx.input(|i| !i.raw.hovered_files.is_empty());
+        if is_hovering {
+            let painter = ctx.layer_painter(egui::LayerId::new(
+                egui::Order::Foreground,
+                egui::Id::new("drag_and_drop_overlay"),
+            ));
+            let screen_rect = ctx.screen_rect();
+            painter.rect_filled(screen_rect, 0.0, egui::Color32::from_black_alpha(190));
+            painter.text(
+                screen_rect.center(),
+                egui::Align2::CENTER_CENTER,
+                "Отпустите мышь, чтобы открыть папку в ReStem",
+                egui::FontId::proportional(24.0),
+                egui::Color32::from_rgb(40, 180, 99),
+            );
+        }
+    }
 }
 
 impl eframe::App for ReStemApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.handle_drag_and_drop(ctx);
+
         let mut needs_recalc = false;
         let mut needs_reload = false;
 
@@ -479,6 +537,9 @@ impl eframe::App for ReStemApp {
             ui.horizontal(|ui| {
                 if ui.button("Обзор папки...").clicked() {
                     if let Some(folder) = rfd::FileDialog::new().pick_folder() {
+                        if self.current_dir.as_ref() != Some(&folder) {
+                            self.excluded_paths.clear();
+                        }
                         self.current_dir = Some(folder);
                         needs_reload = true;
                     }
@@ -487,7 +548,9 @@ impl eframe::App for ReStemApp {
                     .current_dir
                     .as_ref()
                     .map(|p| p.display().to_string())
-                    .unwrap_or_else(|| "Папка не выбрана".to_string());
+                    .unwrap_or_else(|| {
+                        "Папка не выбрана (можно перетащить папку мышью в окно)".to_string()
+                    });
                 ui.label(dir_text);
             });
 
@@ -502,6 +565,18 @@ impl eframe::App for ReStemApp {
                     .changed()
                 {
                     needs_reload = true;
+                }
+
+                ui.separator();
+                if ui.button("Инвертировать галочки").clicked() {
+                    for row in &self.preview_rows {
+                        if self.excluded_paths.contains(&row.old_path) {
+                            self.excluded_paths.remove(&row.old_path);
+                        } else {
+                            self.excluded_paths.insert(row.old_path.clone());
+                        }
+                    }
+                    needs_recalc = true;
                 }
 
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -679,16 +754,32 @@ impl eframe::App for ReStemApp {
 
             ui.separator();
 
+            let mut toggle_all: Option<bool> = None;
+            let mut toggled_item: Option<(PathBuf, bool)> = None;
+            let all_included = !self.preview_rows.is_empty()
+                && self.preview_rows.iter().all(|r| r.included);
+
             TableBuilder::new(ui)
                 .striped(true)
                 .resizable(true)
                 .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
+                .column(Column::exact(32.0))
                 .column(Column::initial(70.0).resizable(true))
-                .column(Column::initial(220.0).resizable(true))
-                .column(Column::initial(320.0).resizable(true))
-                .column(Column::initial(320.0).resizable(true))
+                .column(Column::initial(200.0).resizable(true))
+                .column(Column::initial(310.0).resizable(true))
+                .column(Column::initial(310.0).resizable(true))
                 .column(Column::remainder())
                 .header(22.0, |mut header| {
+                    header.col(|ui| {
+                        let mut master = all_included;
+                        if ui
+                            .checkbox(&mut master, "")
+                            .on_hover_text("Включить / исключить все строки")
+                            .changed()
+                        {
+                            toggle_all = Some(master);
+                        }
+                    });
                     header.col(|ui| {
                         ui.strong("Тип");
                     });
@@ -708,21 +799,44 @@ impl eframe::App for ReStemApp {
                 .body(|body| {
                     body.rows(20.0, self.preview_rows.len(), |mut row| {
                         let item = &self.preview_rows[row.index()];
+                        let weak_color = egui::Color32::from_gray(120);
+
                         row.col(|ui| {
-                            if item.is_dir {
+                            let mut inc = item.included;
+                            if ui.checkbox(&mut inc, "").changed() {
+                                toggled_item = Some((item.old_path.clone(), inc));
+                            }
+                        });
+                        row.col(|ui| {
+                            if !item.included {
+                                ui.colored_label(
+                                    weak_color,
+                                    if item.is_dir { "[Папка]" } else { "Файл" },
+                                );
+                            } else if item.is_dir {
                                 ui.colored_label(egui::Color32::from_rgb(230, 160, 40), "[Папка]");
                             } else {
                                 ui.label("Файл");
                             }
                         });
                         row.col(|ui| {
-                            ui.label(&item.rel_parent);
+                            if item.included {
+                                ui.label(&item.rel_parent);
+                            } else {
+                                ui.colored_label(weak_color, &item.rel_parent);
+                            }
                         });
                         row.col(|ui| {
-                            ui.label(&item.old_name);
+                            if item.included {
+                                ui.label(&item.old_name);
+                            } else {
+                                ui.colored_label(weak_color, &item.old_name);
+                            }
                         });
                         row.col(|ui| {
-                            if item.changed {
+                            if !item.included {
+                                ui.colored_label(weak_color, &item.old_name);
+                            } else if item.changed {
                                 ui.colored_label(
                                     egui::Color32::from_rgb(40, 180, 99),
                                     &item.new_name,
@@ -732,7 +846,9 @@ impl eframe::App for ReStemApp {
                             }
                         });
                         row.col(|ui| {
-                            if item.changed {
+                            if !item.included {
+                                ui.colored_label(weak_color, "Пропущен");
+                            } else if item.changed {
                                 ui.colored_label(egui::Color32::from_rgb(40, 180, 99), "Изменится");
                             } else {
                                 ui.label("Без изменений");
@@ -740,6 +856,26 @@ impl eframe::App for ReStemApp {
                         });
                     });
                 });
+
+            if let Some(select_all) = toggle_all {
+                if select_all {
+                    for row in &self.preview_rows {
+                        self.excluded_paths.remove(&row.old_path);
+                    }
+                } else {
+                    for row in &self.preview_rows {
+                        self.excluded_paths.insert(row.old_path.clone());
+                    }
+                }
+                self.recalculate_preview();
+            } else if let Some((path, include)) = toggled_item {
+                if include {
+                    self.excluded_paths.remove(&path);
+                } else {
+                    self.excluded_paths.insert(path);
+                }
+                self.recalculate_preview();
+            }
         });
     }
 }
