@@ -18,7 +18,7 @@
 
 ## 🇷🇺 ReStem — Пакетное переименование файлов и папок
 
-**ReStem** — это легковесная нативная десктопная утилита для пакетного переименования файлов и каталогов, написанная на языке **Rust** с использованием графического движка `eframe` (`egui`). Программа работает из единого портативного `.exe` файла размером ~3–4 МБ, запускается за миллисекунды, не требует установки сторонних библиотек и плавно отображает десятки тысяч объектов благодаря виртуальной таблице.
+**ReStem** — это легковесная нативная десктопная утилита для пакетного переименования файлов и каталогов, написанная на языке **Rust** с использованием графического движка `eframe` (`egui`). Программа работает из единого портативного `.exe` файла, запускается за миллисекунды, не требует установки сторонних библиотек и плавно отображает десятки тысяч объектов благодаря виртуальной таблице.
 
 ### ✨ Ключевые возможности
 
@@ -26,7 +26,15 @@
   * Гибкая фильтрация объектов: переименовывайте только файлы, только папки или всё дерево каталогов рекурсивно.
   * **Безопасный иерархический обход (Bottom-Up):** при переименовании вложенных структур программа автоматически начинает с самого глубокого уровня вложенности и движется к корню, исключая ошибки потери пути.
   * У папок с точками в названии (например, `Отчет_2026.11`) часть после точки не воспринимается как расширение файла — имя каталога обрабатывается целиком.
-* **Предпросмотр в реальном времени и точечный выбор:**
+* **Встроенный предпросмотр изображений, текста и папок:**
+  * Клик по любому имени объекта в таблице открывает его в блоке **«Предпросмотр объекта»** на левой панели:
+    * **Изображения (`jpg`, `jpeg`, `png`, `webp`, `bmp`, `ico`, `gif`):** отображаются в виде масштабируемой миниатюры с указанием точного разрешения в пикселях (например, `1920 × 1080 px`).
+    * **Текстовые файлы и исходный код (`txt`, `md`, `json`, `csv`, `log`, `ini`, `rs`, `py` и др.):** мгновенный предпросмотр первых 4 КБ содержимого с автоматическим распознаванием бинарных файлов.
+    * **Папки:** отображение количества вложенных объектов и кнопка быстрого перехода внутрь каталога.
+* **Безопасное удаление в Корзину Windows:**
+  * **Пакетное удаление:** кнопка **«🗑 В корзину (N)»** на верхней панели инструментов перемещает все отмеченные галочками файлы и папки в стандартную Корзину Windows после подтверждения в диалоговом окне.
+  * **Одиночное удаление:** кнопка быстрого удаления выбранного файла или папки прямо внутри карточки предпросмотра.
+* **Предпросмотр новых имён в реальном времени и точечный выбор:**
   * Любое изменение правил мгновенно отображается в колонке **«Новое имя»** с контрастной цветовой подсветкой.
   * Индивидуальные галочки (чекбоксы) напротив каждой строки позволяют исключить отдельные файлы или папки из пакетной обработки, а кнопка **«Инвертировать»** и главный чекбокс в шапке таблицы ускоряют массовый выбор.
   * Сквозной счётчик нумерации автоматически пропускает снятые с выбора строки, не создавая пропусков в последовательности номеров.
@@ -39,7 +47,7 @@
   * Поиск по имени в верхней панели с поддержкой **регулярных выражений (`.*`)** и учёта регистра (`Aa`).
   * Автоматическое скрытие системных и скрытых файлов Windows, а также служебных каталогов (`.git`, `node_modules`, `$RECYCLE.BIN`).
 * **Трёхколоночный интерфейс в стиле современного Проводника:**
-  * **Левая панель:** встроенная навигация по подпапкам (`⬆ На уровень вверх` и быстрый переход в дочерние каталоги) + блок **«Шаблоны правил»** для применения популярных настроек в 1 клик.
+  * **Левая панель:** встроенная навигация по подпапкам (`⬆ На уровень вверх` и быстрый переход в дочерние каталоги), блок **«Предпросмотр объекта»** и блок **«Шаблоны правил»** для применения популярных настроек в 1 клик.
   * **Центральная панель:** виртуальная таблица с отображением типа объекта (`📁 Папка` / `📄 Файл`), относительного пути, предпросмотра нового имени, статуса, размера и даты модификации.
   * **Правая панель:** сгруппированный инспектор из 6 модулей правил и фильтров.
 * **Поддержка Drag-and-Drop:** перетащите любую папку или файл из Проводника Windows прямо в окно ReStem для мгновенной загрузки списка.
@@ -96,7 +104,7 @@
 
 ## 🇬🇧 ReStem — Fast Bulk File & Folder Renamer
 
-**ReStem** is a lightweight, native desktop utility for batch renaming files and directories, built in **Rust** using the `eframe` (`egui`) immediate-mode GUI framework. It runs from a single portable `.exe` (~3–4 MB) with zero external dependencies, launches instantaneously, and smoothly handles tens of thousands of items using virtual table rendering.
+**ReStem** is a lightweight, native desktop utility for batch renaming files and directories, built in **Rust** using the `eframe` (`egui`) immediate-mode GUI framework. It runs from a single portable `.exe` with zero external dependencies, launches instantaneously, and smoothly handles tens of thousands of items using virtual table rendering.
 
 ### ✨ Key Features
 
@@ -104,6 +112,14 @@
   * Choose whether to rename files, folders, or entire directory trees recursively.
   * **Safe Bottom-Up Traversal:** when renaming nested directories and files simultaneously, ReStem automatically sorts operations from the deepest nesting level up to the root so parent folder renames never break child paths.
   * Folder names containing dots (e.g., `Report_2026.11`) are treated as complete names rather than split into file extensions.
+* **Built-In Image, Text & Folder Preview:**
+  * Clicking any item name in the table opens it in the **Item Preview** inspector on the left panel:
+    * **Images (`jpg`, `jpeg`, `png`, `webp`, `bmp`, `ico`, `gif`):** renders a proportional thumbnail preview alongside exact pixel dimensions (e.g., `1920 × 1080 px`).
+    * **Text & Code Files (`txt`, `md`, `json`, `csv`, `log`, `ini`, `rs`, `py`, etc.):** instant preview of the first 4 KB of text with automatic binary file detection.
+    * **Folders:** displays the number of contained items and a quick button to enter the directory.
+* **Safe Deletion to Windows Recycle Bin:**
+  * **Batch Trash:** the **🗑 Trash (N)** button in the top toolbar moves all checked files and folders to the Windows Recycle Bin after a confirmation prompt.
+  * **Single-Item Trash:** delete the currently inspected file or folder directly from the preview panel.
 * **Real-Time Preview & Granular Selection:**
   * Every rule adjustment updates the **New Name** column in real time with pill-style color highlighting.
   * Individual checkboxes next to every row let you exclude specific items, while the master header checkbox and **Invert** button speed up batch selection.
@@ -117,7 +133,7 @@
   * Top toolbar search bar with **Regular Expression (`.*`)** and **Case-Sensitive (`Aa`)** toggles.
   * Automatic filtering of hidden/system Windows files and service directories (`.git`, `node_modules`, `$RECYCLE.BIN`).
 * **Modern 3-Column Explorer Layout:**
-  * **Left Panel:** built-in folder navigation (`⬆ Up one level` and quick subfolder switching) + **Saved Presets** for applying common renaming patterns in a single click.
+  * **Left Panel:** built-in folder navigation (`⬆ Up one level` and quick subfolder switching), **Item Preview** card, and **Saved Presets** for applying common renaming patterns in a single click.
   * **Center Panel:** high-performance virtual table displaying item type (`📁 Folder` / `📄 File`), relative path, live new name preview, status, file size, and modification timestamp.
   * **Right Panel:** structured 6-section Rename Rules & Filters inspector.
 * **Drag-and-Drop Support:** drag any folder or file directly from Windows Explorer into the ReStem window to load it immediately.
@@ -137,4 +153,32 @@
    * Optional case sensitivity toggle.
 2. **Case & Transliteration:**
    * Case modes: `Default (No change)` / `lowercase` / `UPPERCASE` / `Capitalize first letter` / `Title Case Words` with full Unicode/UTF-8 support.
-   * **Cyrillic Transliteration (`RU →
+   * **Cyrillic Transliteration (`RU → LAT`):** converts Russian Cyrillic characters into Latin equivalents (`ж → zh`, `ч → ch`, `ш → sh`, `щ → shch`, `ю → yu`, `я → ya`) while preserving capitalization and combining seamlessly with case transformations.
+3. **Add Prefix/Suffix & Trim:**
+   * Insert custom text at the start of the stem or right before the extension.
+   * Trim a specified number of characters from the left or right edge of the name.
+4. **Numbering (Follows Sort Order):**
+   * Prepend or append sequential numbers **strictly following the current table sort order** (e.g., sort by Modified Date to number files chronologically).
+   * Customizable start value, step increment, separator, and zero-padding (`01`, `001`, `0001`), plus **Reset counter per folder** for independent numbering inside subdirectories.
+5. **File Extensions:**
+   * Transform extensions to `lowercase (.jpg)`, `UPPERCASE (.JPG)`, or remove extensions entirely.
+   * Batch-replace existing file extensions with a custom extension (e.g., `jpeg` → `jpg`) without affecting folder names.
+6. **Advanced Filters:**
+   * **Include extensions:** whitelist specific formats (`jpg, png, pdf`).
+   * **Exclude extensions:** blacklist unwanted formats (`tmp, bak, ini`).
+   * **Exclude words in name:** hide items containing comma-separated substrings.
+   * **File size filter:** filter files *Greater than (KB)*, *Less than (KB)*, or *Between (min / max KB)*.
+
+---
+
+### 🚀 Download & Usage
+
+1. Go to the [**Releases**](../../releases) section and download `restem.exe`.
+2. Run `restem.exe` — no installation or runtime required.
+3. Click **📁 Add Folder...** or drag and drop a folder into the application window.
+
+---
+
+### 📄 License
+
+Distributed under the **MIT License**. Free for personal and commercial use.
