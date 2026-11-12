@@ -18,7 +18,7 @@
 
 ## 🇷🇺 ReStem — Пакетное переименование файлов и папок
 
-**ReStem** — это легковесная, нативная десктопная альтернатива **Bulk Rename Utility**, написанная на языке **Rust** с использованием графического движка `eframe` (`egui`). Программа компилируется в единый портативный `.exe` файл размером ~3–4 МБ, запускается за миллисекунды, не требует установки сторонних библиотек и плавно отображает десятки тысяч файлов благодаря виртуальной таблице.
+**ReStem** — это легковесная нативная десктопная утилита для пакетного переименования файлов и каталогов, написанная на языке **Rust** с использованием графического движка `eframe` (`egui`). Программа компилируется в единый портативный `.exe` файл размером ~3–4 МБ, запускается за миллисекунды, не требует установки сторонних библиотек и плавно отображает десятки тысяч объектов благодаря виртуальной таблице.
 
 ### ✨ Ключевые возможности
 
@@ -29,7 +29,7 @@
 * **Предпросмотр в реальном времени и точечный выбор:**
   * Любое изменение правил мгновенно отображается в колонке **«Новое имя»** с контрастной цветовой подсветкой.
   * Индивидуальные галочки (чекбоксы) напротив каждой строки позволяют исключить отдельные файлы или папки из пакетной обработки, а кнопка **«Инвертировать»** и главный чекбокс в шапке таблицы ускоряют массовый выбор.
-  * Сквозной счётчик нумерации автоматически пропускает снятые с выбора строки, не создавая «дыр» в последовательности номеров.
+  * Сквозной счётчик нумерации автоматически пропускает снятые с выбора строки, не создавая пропусков в последовательности номеров.
 * **Трёхколоночный интерфейс в стиле современного Проводника:**
   * **Левая панель:** встроенная навигация по подпапкам (`⬆ На уровень вверх` и быстрый переход в дочерние каталоги) + блок **«Шаблоны правил»** для применения популярных настроек в 1 клик.
   * **Центральная панель:** виртуальная таблица с отображением типа объекта (`📁 Папка` / `📄 Файл`), относительного пути, предпросмотра нового имени, статуса и размера файла.
@@ -50,7 +50,7 @@
    * Замена текста с поддержкой **регулярных выражений (Regex)** и группами захвата (`$1`, `$2`).
    * Опция учёта регистра символов.
 2. **Трансформация регистра (Case Transformation):**
-   * `не менять` / `все строчные` / `ВСЕ ПРОПИСНЫЕ` / `Первая буква заглавная` / `Каждое Слово С Заглавной`.
+   * `Не менять` / `все строчные` / `ВСЕ ПРОПИСНЫЕ` / `Первая буква заглавная` / `Каждое Слово С Заглавной`.
    * Полная поддержка кириллицы и символов UTF-8.
 3. **Префикс, суффикс и обрезка (Add & Trim):**
    * Добавление произвольного текста в начало имени или перед расширением файла.
@@ -67,7 +67,7 @@
 
 ### 🚀 Скачивание и запуск
 
-Готовый исполняемый файл не требует установки Python, Rust или системных библиотек:
+Готовый исполняемый файл не требует установки Python, Rust или дополнительных библиотек:
 1. Перейдите в раздел [**Releases**](../../releases) (или скачайте артефакт `ReStem-Portable` во вкладке **Actions**).
 2. Запустите `restem.exe`.
 3. Нажмите **«📁 Открыть папку...»** или перетащите нужный каталог мышью в окно программы.
@@ -109,7 +109,7 @@ cargo build --release
 
 ## 🇬🇧 ReStem — Fast Bulk File & Folder Renamer
 
-**ReStem** is a lightweight, native desktop alternative to **Bulk Rename Utility**, built in **Rust** using the `eframe` (`egui`) immediate-mode GUI framework. It compiles into a single portable `.exe` (~3–4 MB) with zero external dependencies, launches instantaneously, and smoothly handles tens of thousands of items using virtual table rendering.
+**ReStem** is a lightweight, native desktop utility for batch renaming files and directories, built in **Rust** using the `eframe` (`egui`) immediate-mode GUI framework. It compiles into a single portable `.exe` (~3–4 MB) with zero external dependencies, launches instantaneously, and smoothly handles tens of thousands of items using virtual table rendering.
 
 ### ✨ Key Features
 
@@ -156,29 +156,4 @@ cargo build --release
 
 ### 🚀 Download & Usage
 
-1. Go to the [**Releases**](../../releases) section (or download the `ReStem-Portable` artifact from the **Actions** tab).
-2. Run `restem.exe` — no installation or runtime required.
-3. Click **📁 Add Folder...** or drag and drop a folder into the application window.
-
----
-
-### ⚙️ Building from Source
-
-#### Option A. Zero-Setup Cloud Build via GitHub Actions
-This repository includes a pre-configured `.github/workflows/build.yml` workflow. Every push automatically compiles a size-optimized Windows executable, embeds a generated `.ico` icon and file version metadata via `build.rs`, and publishes `restem.exe` to **GitHub Releases** and **Actions Artifacts**.
-
-#### Option B. Local Build
-Make sure you have the [Rust toolchain](https://rustup.rs/) installed, then run:
-
-```bash
-git clone [https://github.com/YOUR_USERNAME/YOUR_REPO.git](https://github.com/YOUR_USERNAME/YOUR_REPO.git)
-cd YOUR_REPO
-cargo build --release
-```
-The compiled binary will be located at `target/release/restem.exe`. To embed a custom icon instead of the procedurally generated ReStem logo, place an `icon.ico` file in the root directory before building.
-
----
-
-### 📄 License
-
-Distributed under the **MIT License**. Free for personal and commercial use.
+1. Go to the [**Releases**](../../releases) section (or download the `ReStem-
