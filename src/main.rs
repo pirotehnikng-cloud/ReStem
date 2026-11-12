@@ -23,14 +23,12 @@ fn main() -> eframe::Result<()> {
         "ReStem",
         options,
         Box::new(|cc| {
-            // Светлая тема по умолчанию (Вариант 4)
             cc.egui_ctx.set_visuals(egui::Visuals::light());
             Ok(Box::new(ReStemApp::default()))
         }),
     )
 }
 
-/// Программная генерация иконки ReStem (32x32 RGBA) в бирюзово-изумрудной гамме
 fn build_app_icon() -> egui::IconData {
     let width = 32;
     let height = 32;
@@ -42,19 +40,17 @@ fn build_app_icon() -> egui::IconData {
             let dx = (x as f32 - 15.5).abs();
             let dy = (y as f32 - 15.5).abs();
 
-            // Скруглённый тёмно-синий квадрат фона
             if dx < 14.5 && dy < 14.5 && (dx < 11.5 || dy < 11.5 || (dx - 11.5).hypot(dy - 11.5) <= 3.0) {
                 rgba[idx] = 20;
                 rgba[idx + 1] = 30;
                 rgba[idx + 2] = 48;
                 rgba[idx + 3] = 255;
 
-                // Стилизованная буква R со стрелкой (градиент от бирюзового к изумрудному)
                 let in_left_stem = (8..=12).contains(&x) && (7..=24).contains(&y);
                 let in_top_bar = (12..=20).contains(&x) && (7..=10).contains(&y);
                 let in_mid_bar = (12..=20).contains(&x) && (14..=17).contains(&y);
                 let in_right_loop = (19..=23).contains(&x) && (9..=15).contains(&y);
-                let in_leg = (y >= 17 && y <= 24) && ((x as i32 - (y as i32 - 3)).abs() <= 2);
+                let in_leg = (17..=24).contains(&y) && ((x as i32 - (y as i32 - 3)).abs() <= 2);
 
                 if in_left_stem || in_top_bar || in_mid_bar || in_right_loop || in_leg {
                     let t = y as f32 / 32.0;
@@ -78,6 +74,15 @@ fn build_app_icon() -> egui::IconData {
 enum Lang {
     Ru,
     En,
+}
+
+impl Lang {
+    fn tr(self, ru: &'static str, en: &'static str) -> &'static str {
+        match self {
+            Lang::Ru => ru,
+            Lang::En => en,
+        }
+    }
 }
 
 #[derive(PartialEq, Clone, Copy)]
@@ -131,26 +136,22 @@ struct ReStemApp {
     excluded_paths: HashSet<PathBuf>,
     undo_history: Vec<(PathBuf, PathBuf)>,
 
-    // Фильтры верхней панели
     search_query: String,
     include_files: bool,
     include_dirs: bool,
     recursive: bool,
     ext_filter: String,
 
-    // 1. Поиск и замена
     find_str: String,
     replace_str: String,
     use_regex: bool,
     case_sensitive: bool,
 
-    // 2. Добавление и обрезка
     prefix: String,
     suffix: String,
     trim_start: usize,
     trim_end: usize,
 
-    // 3. Регистр и нумерация
     case_mode: CaseMode,
     num_mode: NumMode,
     num_start: usize,
@@ -166,7 +167,7 @@ impl Default for ReStemApp {
     fn default() -> Self {
         Self {
             lang: Lang::Ru,
-            dark_mode: false, // Светлая тема по умолчанию (Вариант 4)
+            dark_mode: false,
             current_dir: None,
             subfolders: Vec::new(),
             all_entries: Vec::new(),
@@ -199,13 +200,6 @@ impl Default for ReStemApp {
 }
 
 impl ReStemApp {
-    fn tr<'a>(&self, ru: &'a str, en: &'a str) -> &'a str {
-        match self.lang {
-            Lang::Ru => ru,
-            Lang::En => en,
-        }
-    }
-
     fn format_size(bytes: u64, is_dir: bool) -> String {
         if is_dir {
             return "—".to_string();
@@ -356,13 +350,11 @@ impl ReStemApp {
             (s, e)
         };
 
-        // 1. Обрезка символов
         let chars: Vec<char> = stem.chars().collect();
         let start = self.trim_start.min(chars.len());
         let end = chars.len().saturating_sub(self.trim_end).max(start);
         stem = chars[start..end].iter().collect();
 
-        // 2. Поиск и замена
         if !self.find_str.is_empty() {
             let pattern = if self.use_regex {
                 self.find_str.clone()
@@ -377,10 +369,8 @@ impl ReStemApp {
             }
         }
 
-        // 3. Префикс и суффикс
         stem = format!("{}{}{}", self.prefix, stem, self.suffix);
 
-        // 4. Регистр
         stem = match self.case_mode {
             CaseMode::None => stem,
             CaseMode::Lower => stem.to_lowercase(),
@@ -407,7 +397,6 @@ impl ReStemApp {
                 .join(" "),
         };
 
-        // 5. Нумерация
         if self.num_mode != NumMode::None {
             let num = self.num_start + idx * self.num_step.max(1);
             let num_str = format!("{:0width$}", num, width = self.num_pad.max(1));
@@ -649,6 +638,7 @@ impl ReStemApp {
 
         let is_hovering = ctx.input(|i| !i.raw.hovered_files.is_empty());
         if is_hovering {
+            let lang = self.lang;
             let painter = ctx.layer_painter(egui::LayerId::new(
                 egui::Order::Foreground,
                 egui::Id::new("drag_and_drop_overlay"),
@@ -658,7 +648,7 @@ impl ReStemApp {
             painter.text(
                 screen_rect.center(),
                 egui::Align2::CENTER_CENTER,
-                self.tr(
+                lang.tr(
                     "Отпустите мышь, чтобы открыть папку в ReStem",
                     "Drop folder here to open in ReStem",
                 ),
@@ -673,6 +663,7 @@ impl eframe::App for ReStemApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.handle_drag_and_drop(ctx);
 
+        let lang = self.lang;
         let mut needs_recalc = false;
         let mut needs_reload = false;
         let mut navigate_to: Option<PathBuf> = None;
@@ -680,11 +671,10 @@ impl eframe::App for ReStemApp {
         let mut trigger_undo = false;
         let mut trigger_reset = false;
 
-        // --- ВЕРХНЯЯ ПАНЕЛЬ ИНСТРУМЕНТОВ (Вариант 4) ---
+        // --- ВЕРХНЯЯ ПАНЕЛЬ ИНСТРУМЕНТОВ ---
         egui::TopBottomPanel::top("top_toolbar").show(ctx, |ui| {
             ui.add_space(6.0);
             ui.horizontal(|ui| {
-                // Мини-логотип ReStem в углу
                 let (rect, _) = ui.allocate_exact_size(egui::vec2(24.0, 24.0), egui::Sense::hover());
                 ui.painter().rect_filled(rect, 5.0, egui::Color32::from_rgb(20, 30, 48));
                 ui.painter().text(
@@ -698,7 +688,7 @@ impl eframe::App for ReStemApp {
                 ui.separator();
 
                 if ui
-                    .button(self.tr("📁 Открыть папку...", "📁 Add Folder..."))
+                    .button(lang.tr("📁 Открыть папку...", "📁 Add Folder..."))
                     .clicked()
                 {
                     if let Some(folder) = rfd::FileDialog::new().pick_folder() {
@@ -707,14 +697,14 @@ impl eframe::App for ReStemApp {
                 }
 
                 if ui
-                    .button(self.tr("🔄 Обновить", "🔄 Refresh"))
+                    .button(lang.tr("🔄 Обновить", "🔄 Refresh"))
                     .clicked()
                 {
                     needs_reload = true;
                 }
 
                 if ui
-                    .button(self.tr("☑ Инвертировать", "☑ Invert"))
+                    .button(lang.tr("☑ Инвертировать", "☑ Invert"))
                     .clicked()
                 {
                     for row in &self.preview_rows {
@@ -730,7 +720,7 @@ impl eframe::App for ReStemApp {
                 if ui
                     .add_enabled(
                         !self.undo_history.is_empty(),
-                        egui::Button::new(self.tr("⮌ Откат (Undo)", "⮌ Undo")),
+                        egui::Button::new(lang.tr("⮌ Откат (Undo)", "⮌ Undo")),
                     )
                     .clicked()
                 {
@@ -739,9 +729,8 @@ impl eframe::App for ReStemApp {
 
                 ui.separator();
 
-                // Строка быстрого поиска по центру (как в Варианте 4)
                 ui.label("🔍");
-                let search_hint = self.tr("Поиск по списку...", "Search files...");
+                let search_hint = lang.tr("Поиск по списку...", "Search files...");
                 if ui
                     .add(
                         egui::TextEdit::singleline(&mut self.search_query)
@@ -757,9 +746,7 @@ impl eframe::App for ReStemApp {
                     needs_recalc = true;
                 }
 
-                // Правый блок: переключатель Темы и Языка
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    // Переключатель языка RU / EN
                     if ui
                         .selectable_label(self.lang == Lang::En, "EN")
                         .on_hover_text("Switch to English")
@@ -779,15 +766,14 @@ impl eframe::App for ReStemApp {
 
                     ui.separator();
 
-                    // Переключатель Светлой и Тёмной темы
                     let theme_label = if self.dark_mode {
-                        self.tr("🌙 Тёмная", "🌙 Dark")
+                        lang.tr("🌙 Тёмная", "🌙 Dark")
                     } else {
-                        self.tr("☀ Светлая", "☀ Light")
+                        lang.tr("☀ Светлая", "☀ Light")
                     };
                     if ui
                         .button(theme_label)
-                        .on_hover_text(self.tr("Сменить тему оформления", "Toggle Light/Dark theme"))
+                        .on_hover_text(lang.tr("Сменить тему оформления", "Toggle Light/Dark theme"))
                         .clicked()
                     {
                         self.dark_mode = !self.dark_mode;
@@ -801,16 +787,16 @@ impl eframe::App for ReStemApp {
                     ui.separator();
 
                     if ui
-                        .checkbox(&mut self.recursive, self.tr("Вложенные", "Recursive"))
+                        .checkbox(&mut self.recursive, lang.tr("Вложенные", "Recursive"))
                         .changed()
                     {
                         needs_reload = true;
                     }
                     needs_recalc |= ui
-                        .checkbox(&mut self.include_dirs, self.tr("Папки", "Folders"))
+                        .checkbox(&mut self.include_dirs, lang.tr("Папки", "Folders"))
                         .changed();
                     needs_recalc |= ui
-                        .checkbox(&mut self.include_files, self.tr("Файлы", "Files"))
+                        .checkbox(&mut self.include_files, lang.tr("Файлы", "Files"))
                         .changed();
                 });
             });
@@ -826,26 +812,26 @@ impl eframe::App for ReStemApp {
                         .current_dir
                         .as_ref()
                         .map(|p| p.display().to_string())
-                        .unwrap_or_else(|| self.tr("Папка не выбрана", "No folder selected").to_string());
+                        .unwrap_or_else(|| lang.tr("Папка не выбрана", "No folder selected").to_string());
                     ui.weak(path_str);
                 });
             });
         });
 
-        // --- ЛЕВАЯ КОЛОНКА: ДЕРЕВО ПАПОК И ПРЕСЕТЫ (Вариант 4) ---
+        // --- ЛЕВАЯ КОЛОНКА: ДЕРЕВО ПАПОК И ШАБЛОНЫ ---
         egui::SidePanel::left("left_explorer_panel")
             .resizable(true)
             .default_width(220.0)
             .width_range(170.0..=340.0)
             .show(ctx, |ui| {
                 ui.add_space(4.0);
-                ui.heading(self.tr("Папки", "Folders"));
+                ui.heading(lang.tr("Папки", "Folders"));
                 ui.separator();
 
                 if let Some(curr) = &self.current_dir {
                     if let Some(parent) = curr.parent() {
                         if ui
-                            .button(self.tr("⬆ На уровень вверх (..)", "⬆ Up one level (..)"))
+                            .button(lang.tr("⬆ На уровень вверх (..)", "⬆ Up one level (..)"))
                             .clicked()
                         {
                             navigate_to = Some(parent.to_path_buf());
@@ -857,7 +843,7 @@ impl eframe::App for ReStemApp {
                         .unwrap_or_else(|| curr.display().to_string());
                     ui.strong(format!("📂 {}", curr_name));
                 } else {
-                    ui.weak(self.tr(
+                    ui.weak(lang.tr(
                         "Нажмите «Открыть папку» или перетащите каталог сюда",
                         "Click 'Add Folder' or drag a folder here",
                     ));
@@ -880,13 +866,13 @@ impl eframe::App for ReStemApp {
                     });
 
                 ui.add_space(12.0);
-                ui.heading(self.tr("Шаблоны правил", "Saved Presets"));
+                ui.heading(lang.tr("Шаблоны правил", "Saved Presets"));
                 ui.separator();
-                ui.weak(self.tr("Быстрые настройки в 1 клик:", "One-click presets:"));
+                ui.weak(lang.tr("Быстрые настройки в 1 клик:", "One-click presets:"));
                 ui.add_space(4.0);
 
                 if ui
-                    .button(self.tr("🔹 Пробелы → подчёркивания (_)", "🔹 Spaces to underscores (_)"))
+                    .button(lang.tr("🔹 Пробелы → подчёркивания (_)", "🔹 Spaces to underscores (_)"))
                     .clicked()
                 {
                     self.find_str = " ".to_string();
@@ -895,7 +881,7 @@ impl eframe::App for ReStemApp {
                     needs_recalc = true;
                 }
                 if ui
-                    .button(self.tr("🔹 Подчёркивания (_) → пробелы", "🔹 Underscores (_) to spaces"))
+                    .button(lang.tr("🔹 Подчёркивания (_) → пробелы", "🔹 Underscores (_) to spaces"))
                     .clicked()
                 {
                     self.find_str = "_".to_string();
@@ -904,7 +890,7 @@ impl eframe::App for ReStemApp {
                     needs_recalc = true;
                 }
                 if ui
-                    .button(self.tr("🔹 Нумерация фото (IMG_001)", "🔹 Photo sequence (IMG_001)"))
+                    .button(lang.tr("🔹 Нумерация фото (IMG_001)", "🔹 Photo sequence (IMG_001)"))
                     .clicked()
                 {
                     self.prefix = "IMG_".to_string();
@@ -915,7 +901,7 @@ impl eframe::App for ReStemApp {
                     needs_recalc = true;
                 }
                 if ui
-                    .button(self.tr("🔹 Строчные имена + счётчик", "🔹 Lowercase + counter"))
+                    .button(lang.tr("🔹 Строчные имена + счётчик", "🔹 Lowercase + counter"))
                     .clicked()
                 {
                     self.case_mode = CaseMode::Lower;
@@ -926,7 +912,7 @@ impl eframe::App for ReStemApp {
                     needs_recalc = true;
                 }
                 if ui
-                    .button(self.tr("🔹 Убрать копии « (1)», « (2)»", "🔹 Remove ' (1)', ' (2)' copies"))
+                    .button(lang.tr("🔹 Убрать копии « (1)», « (2)»", "🔹 Remove ' (1)', ' (2)' copies"))
                     .clicked()
                 {
                     self.find_str = r"\s*\(\d+\)".to_string();
@@ -937,98 +923,95 @@ impl eframe::App for ReStemApp {
 
                 ui.add_space(8.0);
                 if ui
-                    .button(self.tr("✖ Сбросить все правила", "✖ Reset All Rules"))
+                    .button(lang.tr("✖ Сбросить все правила", "✖ Reset All Rules"))
                     .clicked()
                 {
                     trigger_reset = true;
                 }
             });
 
-        // --- ПРАВАЯ КОЛОНКА: ИНСПЕКТОР ПРАВИЛ ПЕРЕИМЕНОВАНИЯ (Вариант 4) ---
+        // --- ПРАВАЯ КОЛОНКА: ИНСПЕКТОР ПРАВИЛ ---
         egui::SidePanel::right("right_rules_panel")
             .resizable(true)
             .default_width(290.0)
             .width_range(250.0..=400.0)
             .show(ctx, |ui| {
                 ui.add_space(4.0);
-                ui.heading(self.tr("Правила переименования", "Rename Rules"));
+                ui.heading(lang.tr("Правила переименования", "Rename Rules"));
                 ui.separator();
 
                 egui::ScrollArea::vertical()
                     .id_salt("rules_scroll")
                     .show(ui, |ui| {
-                        // Блок 1: Поиск и замена
                         ui.group(|ui| {
-                            ui.strong(self.tr("1. Поиск и замена", "1. Find & Replace"));
+                            ui.strong(lang.tr("1. Поиск и замена", "1. Find & Replace"));
                             ui.add_space(2.0);
-                            ui.label(self.tr("Найти:", "Find:"));
+                            ui.label(lang.tr("Найти:", "Find:"));
                             needs_recalc |= ui.text_edit_singleline(&mut self.find_str).changed();
-                            ui.label(self.tr("Заменить на:", "Replace with:"));
+                            ui.label(lang.tr("Заменить на:", "Replace with:"));
                             needs_recalc |= ui.text_edit_singleline(&mut self.replace_str).changed();
                             needs_recalc |= ui
-                                .checkbox(&mut self.use_regex, self.tr("Регулярные выражения (Regex)", "Use Regular Expressions"))
+                                .checkbox(&mut self.use_regex, lang.tr("Регулярные выражения (Regex)", "Use Regular Expressions"))
                                 .changed();
                             needs_recalc |= ui
-                                .checkbox(&mut self.case_sensitive, self.tr("Учитывать регистр", "Case Sensitive"))
+                                .checkbox(&mut self.case_sensitive, lang.tr("Учитывать регистр", "Case Sensitive"))
                                 .changed();
                         });
 
                         ui.add_space(6.0);
 
-                        // Блок 2: Трансформация регистра
                         ui.group(|ui| {
-                            ui.strong(self.tr("2. Регистр букв", "2. Case Transformation"));
+                            ui.strong(lang.tr("2. Регистр букв", "2. Case Transformation"));
                             ui.add_space(2.0);
                             egui::ComboBox::from_id_salt("case_cb")
                                 .width(230.0)
                                 .selected_text(match self.case_mode {
-                                    CaseMode::None => self.tr("Не менять", "Default (No change)"),
-                                    CaseMode::Lower => self.tr("все строчные", "lowercase"),
-                                    CaseMode::Upper => self.tr("ВСЕ ПРОПИСНЫЕ", "UPPERCASE"),
-                                    CaseMode::Capitalize => self.tr("Первая буква заглавная", "Capitalize first letter"),
-                                    CaseMode::Title => self.tr("Каждое Слово С Заглавной", "Title Case Words"),
+                                    CaseMode::None => lang.tr("Не менять", "Default (No change)"),
+                                    CaseMode::Lower => lang.tr("все строчные", "lowercase"),
+                                    CaseMode::Upper => lang.tr("ВСЕ ПРОПИСНЫЕ", "UPPERCASE"),
+                                    CaseMode::Capitalize => lang.tr("Первая буква заглавная", "Capitalize first letter"),
+                                    CaseMode::Title => lang.tr("Каждое Слово С Заглавной", "Title Case Words"),
                                 })
                                 .show_ui(ui, |ui| {
                                     needs_recalc |= ui
-                                        .selectable_value(&mut self.case_mode, CaseMode::None, self.tr("Не менять", "Default (No change)"))
+                                        .selectable_value(&mut self.case_mode, CaseMode::None, lang.tr("Не менять", "Default (No change)"))
                                         .changed();
                                     needs_recalc |= ui
-                                        .selectable_value(&mut self.case_mode, CaseMode::Lower, self.tr("все строчные", "lowercase"))
+                                        .selectable_value(&mut self.case_mode, CaseMode::Lower, lang.tr("все строчные", "lowercase"))
                                         .changed();
                                     needs_recalc |= ui
-                                        .selectable_value(&mut self.case_mode, CaseMode::Upper, self.tr("ВСЕ ПРОПИСНЫЕ", "UPPERCASE"))
+                                        .selectable_value(&mut self.case_mode, CaseMode::Upper, lang.tr("ВСЕ ПРОПИСНЫЕ", "UPPERCASE"))
                                         .changed();
                                     needs_recalc |= ui
-                                        .selectable_value(&mut self.case_mode, CaseMode::Capitalize, self.tr("Первая буква заглавная", "Capitalize first letter"))
+                                        .selectable_value(&mut self.case_mode, CaseMode::Capitalize, lang.tr("Первая буква заглавная", "Capitalize first letter"))
                                         .changed();
                                     needs_recalc |= ui
-                                        .selectable_value(&mut self.case_mode, CaseMode::Title, self.tr("Каждое Слово С Заглавной", "Title Case Words"))
+                                        .selectable_value(&mut self.case_mode, CaseMode::Title, lang.tr("Каждое Слово С Заглавной", "Title Case Words"))
                                         .changed();
                                 });
                         });
 
                         ui.add_space(6.0);
 
-                        // Блок 3: Добавление и обрезка
                         ui.group(|ui| {
-                            ui.strong(self.tr("3. Префикс, суффикс и обрезка", "3. Add Prefix/Suffix & Trim"));
+                            ui.strong(lang.tr("3. Префикс, суффикс и обрезка", "3. Add Prefix/Suffix & Trim"));
                             ui.add_space(2.0);
                             egui::Grid::new("prefix_grid").num_columns(2).show(ui, |ui| {
-                                ui.label(self.tr("Префикс:", "Prefix:"));
+                                ui.label(lang.tr("Префикс:", "Prefix:"));
                                 needs_recalc |= ui.text_edit_singleline(&mut self.prefix).changed();
                                 ui.end_row();
 
-                                ui.label(self.tr("Суффикс:", "Suffix:"));
+                                ui.label(lang.tr("Суффикс:", "Suffix:"));
                                 needs_recalc |= ui.text_edit_singleline(&mut self.suffix).changed();
                                 ui.end_row();
 
-                                ui.label(self.tr("Срезать слева:", "Trim left:"));
+                                ui.label(lang.tr("Срезать слева:", "Trim left:"));
                                 needs_recalc |= ui
                                     .add(egui::DragValue::new(&mut self.trim_start).range(0..=100))
                                     .changed();
                                 ui.end_row();
 
-                                ui.label(self.tr("Срезать справа:", "Trim right:"));
+                                ui.label(lang.tr("Срезать справа:", "Trim right:"));
                                 needs_recalc |= ui
                                     .add(egui::DragValue::new(&mut self.trim_end).range(0..=100))
                                     .changed();
@@ -1038,46 +1021,45 @@ impl eframe::App for ReStemApp {
 
                         ui.add_space(6.0);
 
-                        // Блок 4: Автонумерация
                         ui.group(|ui| {
-                            ui.strong(self.tr("4. Нумерация (Сериализация)", "4. Serialization (Numbering)"));
+                            ui.strong(lang.tr("4. Нумерация (Сериализация)", "4. Serialization (Numbering)"));
                             ui.add_space(2.0);
                             egui::ComboBox::from_id_salt("num_cb")
                                 .width(230.0)
                                 .selected_text(match self.num_mode {
-                                    NumMode::None => self.tr("Выключена", "Disabled"),
-                                    NumMode::Suffix => self.tr("В конец имени (Суффикс)", "Append to end (Suffix)"),
-                                    NumMode::Prefix => self.tr("В начало имени (Префикс)", "Prepend to start (Prefix)"),
+                                    NumMode::None => lang.tr("Выключена", "Disabled"),
+                                    NumMode::Suffix => lang.tr("В конец имени (Суффикс)", "Append to end (Suffix)"),
+                                    NumMode::Prefix => lang.tr("В начало имени (Префикс)", "Prepend to start (Prefix)"),
                                 })
                                 .show_ui(ui, |ui| {
                                     needs_recalc |= ui
-                                        .selectable_value(&mut self.num_mode, NumMode::None, self.tr("Выключена", "Disabled"))
+                                        .selectable_value(&mut self.num_mode, NumMode::None, lang.tr("Выключена", "Disabled"))
                                         .changed();
                                     needs_recalc |= ui
-                                        .selectable_value(&mut self.num_mode, NumMode::Suffix, self.tr("В конец имени (Суффикс)", "Append to end (Suffix)"))
+                                        .selectable_value(&mut self.num_mode, NumMode::Suffix, lang.tr("В конец имени (Суффикс)", "Append to end (Suffix)"))
                                         .changed();
                                     needs_recalc |= ui
-                                        .selectable_value(&mut self.num_mode, NumMode::Prefix, self.tr("В начало имени (Префикс)", "Prepend to start (Prefix)"))
+                                        .selectable_value(&mut self.num_mode, NumMode::Prefix, lang.tr("В начало имени (Префикс)", "Prepend to start (Prefix)"))
                                         .changed();
                                 });
 
                             ui.horizontal(|ui| {
-                                ui.label(self.tr("Старт:", "Start:"));
+                                ui.label(lang.tr("Старт:", "Start:"));
                                 needs_recalc |= ui
                                     .add(egui::DragValue::new(&mut self.num_start).range(0..=99999))
                                     .changed();
-                                ui.label(self.tr("Шаг:", "Step:"));
+                                ui.label(lang.tr("Шаг:", "Step:"));
                                 needs_recalc |= ui
                                     .add(egui::DragValue::new(&mut self.num_step).range(1..=1000))
                                     .changed();
                             });
 
                             ui.horizontal(|ui| {
-                                ui.label(self.tr("Цифр (001):", "Zero pad:"));
+                                ui.label(lang.tr("Цифр (001):", "Zero pad:"));
                                 needs_recalc |= ui
                                     .add(egui::DragValue::new(&mut self.num_pad).range(1..=10))
                                     .changed();
-                                ui.label(self.tr("Раздел.:", "Sep:"));
+                                ui.label(lang.tr("Раздел.:", "Sep:"));
                                 needs_recalc |= ui
                                     .add(egui::TextEdit::singleline(&mut self.num_sep).desired_width(36.0))
                                     .changed();
@@ -1086,25 +1068,23 @@ impl eframe::App for ReStemApp {
                             needs_recalc |= ui
                                 .checkbox(
                                     &mut self.reset_num_per_dir,
-                                    self.tr("Сброс счётчика в подпапках", "Reset counter per folder"),
+                                    lang.tr("Сброс счётчика в подпапках", "Reset counter per folder"),
                                 )
                                 .changed();
                         });
 
                         ui.add_space(6.0);
 
-                        // Блок 5: Фильтр по расширениям
                         ui.group(|ui| {
-                            ui.strong(self.tr("5. Фильтр расширений", "5. Extension Filter"));
-                            ui.label(self.tr("Только расширения (jpg, png):", "Only extensions (jpg, png):"));
+                            ui.strong(lang.tr("5. Фильтр расширений", "5. Extension Filter"));
+                            ui.label(lang.tr("Только расширения (jpg, png):", "Only extensions (jpg, png):"));
                             needs_recalc |= ui.text_edit_singleline(&mut self.ext_filter).changed();
                         });
 
                         ui.add_space(12.0);
 
-                        // Главная синяя кнопка «Применить изменения» (как в Варианте 4)
                         let btn_text = egui::RichText::new(
-                            self.tr("✔ Применить изменения", "✔ Apply Changes"),
+                            lang.tr("✔ Применить изменения", "✔ Apply Changes"),
                         )
                         .color(egui::Color32::WHITE)
                         .strong()
@@ -1120,7 +1100,7 @@ impl eframe::App for ReStemApp {
                     });
             });
 
-        // --- ЦЕНТРАЛЬНАЯ ТАБЛИЦА ПРЕДПРОСМОТРА (Вариант 4) ---
+        // --- ЦЕНТРАЛЬНАЯ ТАБЛИЦА ПРЕДПРОСМОТРА ---
         egui::CentralPanel::default().show(ctx, |ui| {
             if let Some(folder) = navigate_to {
                 self.open_new_directory(folder);
@@ -1142,7 +1122,7 @@ impl eframe::App for ReStemApp {
                 self.undo_rename();
             }
 
-            ui.heading(self.tr("Файлы и папки для переименования", "Files to Rename"));
+            ui.heading(lang.tr("Файлы и папки для переименования", "Files to Rename"));
             ui.add_space(4.0);
 
             let mut toggle_all: Option<bool> = None;
@@ -1150,17 +1130,17 @@ impl eframe::App for ReStemApp {
             let all_included = !self.preview_rows.is_empty()
                 && self.preview_rows.iter().all(|r| r.included);
 
-            let col_type_title = self.tr("Тип", "Type");
-            let col_orig_title = self.tr("Текущее имя", "Original Name");
-            let col_new_title = self.tr("Новое имя", "New Name");
-            let col_status_title = self.tr("Статус", "Status");
-            let col_size_title = self.tr("Размер", "Size");
+            let col_type_title = lang.tr("Тип", "Type");
+            let col_orig_title = lang.tr("Текущее имя", "Original Name");
+            let col_new_title = lang.tr("Новое имя", "New Name");
+            let col_status_title = lang.tr("Статус", "Status");
+            let col_size_title = lang.tr("Размер", "Size");
 
-            let status_ready = self.tr("Готов", "Ready");
-            let status_changed = self.tr("Изменится", "Preview");
-            let status_skipped = self.tr("Пропущен", "Skipped");
-            let label_folder = self.tr("📁 Папка", "📁 Folder");
-            let label_file = self.tr("📄 Файл", "📄 File");
+            let status_ready = lang.tr("Готов", "Ready");
+            let status_changed = lang.tr("Изменится", "Preview");
+            let status_skipped = lang.tr("Пропущен", "Skipped");
+            let label_folder = lang.tr("📁 Папка", "📁 Folder");
+            let label_file = lang.tr("📄 Файл", "📄 File");
 
             let is_dark = self.dark_mode;
 
@@ -1233,7 +1213,6 @@ impl eframe::App for ReStemApp {
                             }
                         });
 
-                        // Столбец «Новое имя» с цветной плашкой (как в Варианте 4)
                         row.col(|ui| {
                             if !item.included {
                                 ui.colored_label(muted, &item.old_name);
