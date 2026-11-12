@@ -6,6 +6,7 @@ use regex::RegexBuilder;
 use std::cmp::Ordering;
 use std::collections::HashSet;
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::UNIX_EPOCH;
@@ -15,8 +16,8 @@ fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("ReStem — Пакетное переименование файлов и папок")
-            .with_inner_size([1320.0, 800.0])
-            .with_min_inner_size([1020.0, 600.0])
+            .with_inner_size([1340.0, 820.0])
+            .with_min_inner_size([1020.0, 620.0])
             .with_drag_and_drop(true)
             .with_icon(Arc::new(icon)),
         ..Default::default()
@@ -75,7 +76,7 @@ fn build_app_icon() -> egui::IconData {
     }
 }
 
-/// Умная («натуральная») сортировка строк с учётом чисел (file2 < file10)
+/// Умная («натуральная») сортировка строк с учётом чисел (file2 перед file10)
 fn natural_cmp(a: &str, b: &str) -> Ordering {
     let mut ia = a.chars().peekable();
     let mut ib = b.chars().peekable();
@@ -195,6 +196,13 @@ fn transliterate_cyrillic(input: &str) -> String {
     out
 }
 
+fn is_image_ext(ext: &str) -> bool {
+    matches!(
+        ext,
+        "jpg" | "jpeg" | "png" | "webp" | "bmp" | "ico" | "gif"
+    )
+}
+
 #[derive(PartialEq, Clone, Copy)]
 enum Lang {
     Ru,
@@ -260,6 +268,30 @@ enum ExtMode {
     Remove,
 }
 
+enum PreviewState {
+    Empty,
+    Folder {
+        name: String,
+        items_count: usize,
+    },
+    Image {
+        name: String,
+        texture: egui::TextureHandle,
+        orig_w: u32,
+        orig_h: u32,
+        tex_size: egui::Vec2,
+    },
+    Text {
+        name: String,
+        content: String,
+        truncated: bool,
+    },
+    BinaryOrOther {
+        name: String,
+        info: String,
+    },
+}
+
 #[derive(Clone)]
 struct FsEntry {
     path: PathBuf,
@@ -299,6 +331,11 @@ struct ReStemApp {
     preview_rows: Vec<PreviewRow>,
     excluded_paths: HashSet<PathBuf>,
     undo_history: Vec<(PathBuf, PathBuf)>,
+
+    // Предпросмотр и удаление
+    selected_path: Option<PathBuf>,
+    preview_state: PreviewState,
+    confirm_trash_modal: bool,
 
     // Настройки сортировки
     sort_field: SortField,
@@ -366,6 +403,10 @@ impl Default for ReStemApp {
             excluded_paths: HashSet::new(),
             undo_history: Vec::new(),
 
+            selected_path: None,
+            preview_state: PreviewState::Empty,
+            confirm_trash_modal: false,
+
             sort_field: SortField::NaturalName,
             sort_asc: true,
             folders_first: true,
@@ -424,10 +465,7 @@ impl ReStemApp {
     }
 
     fn is_entry_hidden(path: &Path, meta: Option<&fs::Metadata>) -> bool {
-        let name = path
-            .file_name()
-            .unwrap_or_default()
-            .to_string_lossy();
+        let name = path.file_name().unwrap_or_default().to_string_lossy();
         if name.starts_with('.')
             || name.eq_ignore_ascii_case("node_modules")
             || name.eq_ignore_ascii_case("$RECYCLE.BIN")
@@ -439,7 +477,6 @@ impl ReStemApp {
         if let Some(m) = meta {
             use std::os::windows::fs::MetadataExt;
             let attrs = m.file_attributes();
-            // FILE_ATTRIBUTE_HIDDEN (0x2) | FILE_ATTRIBUTE_SYSTEM (0x4)
             if (attrs & 0x2) != 0 || (attrs & 0x4) != 0 {
                 return true;
             }
@@ -450,9 +487,152 @@ impl ReStemApp {
         false
     }
 
+    fn select_for_preview(&mut self, path: PathBuf, ctx: &egui::Context) {
+        let name = path
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_string();
+        self.selected_path = Some(path.clone());
+
+        if path.is_dir() {
+            let count = fs::read_dir(&path)
+                .map(|rd| rd.flatten().count())
+                .unwrap_or(0);
+            self.preview_state = PreviewState::Folder {
+                name,
+                items_count: count,
+            };
+            return;
+        }
+
+        let ext = path
+            .extension()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_lowercase();
+
+        // 1. Попытка загрузить превью картинки
+        if is_image_ext(&ext) {
+            match image::open(&path) {
+                Ok(img) => {
+                    let orig_w = img.width();
+                    let orig_h = img.height();
+                    let thumb = img.thumbnail(320, 320);
+                    let rgba = thumb.to_rgba8();
+                    let tw = rgba.width() as usize;
+                    let th = rgba.height() as usize;
+                    let color_img = egui::ColorImage::from_rgba_unmultiplied(
+                        [tw, th],
+                        rgba.as_flat_samples().as_slice(),
+                    );
+                    let texture =
+                        ctx.load_texture("item_preview_img", color_img, egui::TextureOptions::LINEAR);
+                    self.preview_state = PreviewState::Image {
+                        name,
+                        texture,
+                        orig_w,
+                        orig_h,
+                        tex_size: egui::vec2(tw as f32, th as f32),
+                    };
+                }
+                Err(e) => {
+                    self.preview_state = PreviewState::BinaryOrOther {
+                        name,
+                        info: format!("Ошибка чтения изображения: {}", e),
+                    };
+                }
+            }
+            return;
+        }
+
+        // 2. Попытка прочитать текстовый фрагмент (до 4096 байт)
+        match fs::File::open(&path) {
+            Ok(file) => {
+                let mut buf = Vec::with_capacity(4096);
+                let mut chunk = file.take(4096);
+                if chunk.read_to_end(&mut buf).is_ok() {
+                    if buf.is_empty() {
+                        self.preview_state = PreviewState::Text {
+                            name,
+                            content: self.lang.tr("(Пустой файл)", "(Empty file)").to_string(),
+                            truncated: false,
+                        };
+                    } else if buf.iter().take(512).any(|&b| b == 0) {
+                        self.preview_state = PreviewState::BinaryOrOther {
+                            name,
+                            info: self
+                                .lang
+                                .tr(
+                                    "Бинарный файл (предпросмотр текста недоступен)",
+                                    "Binary file (text preview unavailable)",
+                                )
+                                .to_string(),
+                        };
+                    } else {
+                        let truncated = buf.len() == 4096;
+                        let text = String::from_utf8_lossy(&buf).to_string();
+                        self.preview_state = PreviewState::Text {
+                            name,
+                            content: text,
+                            truncated,
+                        };
+                    }
+                } else {
+                    self.preview_state = PreviewState::BinaryOrOther {
+                        name,
+                        info: self
+                            .lang
+                            .tr("Не удалось прочитать файл", "Failed to read file")
+                            .to_string(),
+                    };
+                }
+            }
+            Err(e) => {
+                self.preview_state = PreviewState::BinaryOrOther {
+                    name,
+                    info: format!("Ошибка доступа: {}", e),
+                };
+            }
+        }
+    }
+
+    fn delete_paths_to_trash(&mut self, targets: Vec<PathBuf>) {
+        if targets.is_empty() {
+            return;
+        }
+        let count = targets.len();
+        match trash::delete_all(&targets) {
+            Ok(()) => {
+                for p in &targets {
+                    self.excluded_paths.remove(p);
+                    if self.selected_path.as_ref() == Some(p) {
+                        self.selected_path = None;
+                        self.preview_state = PreviewState::Empty;
+                    }
+                }
+                if let Some(dir) = self.current_dir.clone() {
+                    self.load_directory(dir);
+                }
+                self.status_msg = match self.lang {
+                    Lang::Ru => format!("Перемещено в Корзину объектов: {}", count),
+                    Lang::En => format!("Moved to Recycle Bin: {} items", count),
+                };
+            }
+            Err(e) => {
+                self.status_msg = match self.lang {
+                    Lang::Ru => format!("Ошибка удаления в Корзину: {}", e),
+                    Lang::En => format!("Failed to move to Recycle Bin: {}", e),
+                };
+            }
+        }
+    }
+
     fn open_new_directory(&mut self, root_dir: PathBuf) {
         if self.current_dir.as_ref() != Some(&root_dir) {
             self.excluded_paths.clear();
+            self.selected_path = None;
+            self.preview_state = PreviewState::Empty;
         }
         self.load_directory(root_dir);
     }
@@ -628,13 +808,11 @@ impl ReStemApp {
             (s, e)
         };
 
-        // 1. Обрезка символов по краям
         let chars: Vec<char> = stem.chars().collect();
         let start = self.trim_start.min(chars.len());
         let end = chars.len().saturating_sub(self.trim_end).max(start);
         stem = chars[start..end].iter().collect();
 
-        // 2. Поиск и замена
         if !self.find_str.is_empty() {
             let pattern = if self.use_regex {
                 self.find_str.clone()
@@ -649,15 +827,12 @@ impl ReStemApp {
             }
         }
 
-        // 3. Префикс и суффикс
         stem = format!("{}{}{}", self.prefix, stem, self.suffix);
 
-        // 4. Транслитерация кириллицы (RU -> LAT)
         if self.transliterate {
             stem = transliterate_cyrillic(&stem);
         }
 
-        // 5. Изменение регистра
         stem = match self.case_mode {
             CaseMode::None => stem,
             CaseMode::Lower => stem.to_lowercase(),
@@ -686,7 +861,6 @@ impl ReStemApp {
                 .join(" "),
         };
 
-        // 6. Нумерация
         if self.num_mode != NumMode::None {
             let num = self.num_start + idx * self.num_step.max(1);
             let num_str = format!("{:0width$}", num, width = self.num_pad.max(1));
@@ -701,7 +875,6 @@ impl ReStemApp {
             };
         }
 
-        // 7. Обработка расширения (только для файлов)
         let final_ext = if entry.is_dir {
             String::new()
         } else {
@@ -784,7 +957,6 @@ impl ReStemApp {
                     return false;
                 }
 
-                // Поиск по имени (обычный или Regex)
                 if !search_trimmed.is_empty() {
                     if let Some(re) = &search_re {
                         if !re.is_match(&e.name) {
@@ -795,7 +967,6 @@ impl ReStemApp {
                     }
                 }
 
-                // Исключающие слова
                 if !excluded_words.is_empty() {
                     let name_low = e.name.to_lowercase();
                     if excluded_words.iter().any(|w| name_low.contains(w)) {
@@ -803,7 +974,6 @@ impl ReStemApp {
                     }
                 }
 
-                // Фильтры расширений
                 if !allowed_exts.is_empty() {
                     if e.is_dir || !allowed_exts.contains(&e.ext_lower) {
                         return false;
@@ -813,7 +983,6 @@ impl ReStemApp {
                     return false;
                 }
 
-                // Фильтр по размеру (для файлов)
                 if !e.is_dir {
                     let min_b = self.size_min_kb.saturating_mul(1024);
                     let max_b = self.size_max_kb.saturating_mul(1024);
@@ -841,7 +1010,6 @@ impl ReStemApp {
             })
             .collect();
 
-        // Сортируем отфильтрованный список перед расчётом нумерации
         filtered.sort_by(|a, b| self.compare_entries(a, b));
 
         self.preview_rows.clear();
@@ -873,7 +1041,6 @@ impl ReStemApp {
 
             let changed = included && old_name != new_name && !new_name.is_empty();
 
-            // Фильтр по итоговому статусу строки
             let pass_status = match self.status_filter {
                 StatusFilter::All => true,
                 StatusFilter::OnlyChanged => changed,
@@ -982,7 +1149,6 @@ impl ReStemApp {
             .cloned()
             .collect();
 
-        // Иерархическая сортировка снизу вверх (от глубоких уровней к корню) для безопасности путей
         to_rename.sort_by(|a, b| {
             b.depth
                 .cmp(&a.depth)
@@ -1088,11 +1254,76 @@ impl eframe::App for ReStemApp {
         let mut trigger_undo = false;
         let mut trigger_reset = false;
         let mut clicked_sort_col: Option<SortField> = None;
+        let mut inspect_target: Option<PathBuf> = None;
+        let mut single_trash_target: Option<PathBuf> = None;
 
-        // --- ВЕРХНЯЯ ПАНЕЛЬ ИНСТРУМЕНТОВ И БЫСТРОЙ СОРТИРОВКИ ---
+        let checked_count = self.preview_rows.iter().filter(|r| r.included).count();
+
+        // --- МОДАЛЬНОЕ ОКНО ПОДТВЕРЖДЕНИЯ УДАЛЕНИЯ В КОРЗИНУ ---
+        if self.confirm_trash_modal {
+            let mut open = true;
+            let mut confirm_now = false;
+            let mut close_now = false;
+
+            egui::Window::new(lang.tr("🗑 Удаление в Корзину", "🗑 Move to Recycle Bin"))
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .open(&mut open)
+                .show(ctx, |ui| {
+                    ui.add_space(4.0);
+                    let msg = match lang {
+                        Lang::Ru => format!(
+                            "Переместить отмеченные галочками объекты ({} шт.) в Корзину Windows?",
+                            checked_count
+                        ),
+                        Lang::En => format!(
+                            "Move checked items ({} total) to the Windows Recycle Bin?",
+                            checked_count
+                        ),
+                    };
+                    ui.label(msg);
+                    ui.weak(lang.tr(
+                        "Вы сможете восстановить их из стандартной Корзины Windows.",
+                        "You can restore them anytime from the Windows Recycle Bin.",
+                    ));
+                    ui.add_space(10.0);
+                    ui.horizontal(|ui| {
+                        let del_btn = egui::Button::new(
+                            egui::RichText::new(lang.tr(
+                                "🗑 Да, переместить в Корзину",
+                                "🗑 Yes, Move to Recycle Bin",
+                            ))
+                            .color(egui::Color32::WHITE),
+                        )
+                        .fill(egui::Color32::from_rgb(205, 55, 55));
+
+                        if ui.add(del_btn).clicked() {
+                            confirm_now = true;
+                        }
+                        if ui.button(lang.tr("Отмена", "Cancel")).clicked() {
+                            close_now = true;
+                        }
+                    });
+                });
+
+            if confirm_now {
+                let targets: Vec<PathBuf> = self
+                    .preview_rows
+                    .iter()
+                    .filter(|r| r.included)
+                    .map(|r| r.old_path.clone())
+                    .collect();
+                self.confirm_trash_modal = false;
+                self.delete_paths_to_trash(targets);
+            } else if close_now || !open {
+                self.confirm_trash_modal = false;
+            }
+        }
+
+        // --- ВЕРХНЯЯ ПАНЕЛЬ ИНСТРУМЕНТОВ ---
         egui::TopBottomPanel::top("top_toolbar").show(ctx, |ui| {
             ui.add_space(5.0);
-            // Ряд 1: Основные действия, поиск, тема и язык
             ui.horizontal(|ui| {
                 let (rect, _) =
                     ui.allocate_exact_size(egui::vec2(24.0, 24.0), egui::Sense::hover());
@@ -1145,16 +1376,30 @@ impl eframe::App for ReStemApp {
                     trigger_undo = true;
                 }
 
+                let trash_label = match lang {
+                    Lang::Ru => format!("🗑 В корзину ({})", checked_count),
+                    Lang::En => format!("🗑 Trash ({})", checked_count),
+                };
+                if ui
+                    .add_enabled(checked_count > 0, egui::Button::new(trash_label))
+                    .on_hover_text(lang.tr(
+                        "Переместить отмеченные галочками файлы и папки в Корзину Windows",
+                        "Move checked files and folders to the Windows Recycle Bin",
+                    ))
+                    .clicked()
+                {
+                    self.confirm_trash_modal = true;
+                }
+
                 ui.separator();
 
-                // Поиск с опциями Regex и регистра
                 ui.label("🔍");
                 let search_hint = lang.tr("Поиск по имени...", "Filter by name...");
                 if ui
                     .add(
                         egui::TextEdit::singleline(&mut self.search_query)
                             .hint_text(search_hint)
-                            .desired_width(160.0),
+                            .desired_width(145.0),
                     )
                     .changed()
                 {
@@ -1229,7 +1474,7 @@ impl eframe::App for ReStemApp {
 
             ui.separator();
 
-            // Ряд 2: Панель фильтрации объектов и сортировки
+            // Ряд 2: Панель фильтрации и сортировки
             ui.horizontal(|ui| {
                 ui.strong(lang.tr("Объекты:", "Items:"));
                 needs_recalc |= ui
@@ -1256,7 +1501,6 @@ impl eframe::App for ReStemApp {
 
                 ui.separator();
 
-                // Фильтр по статусу
                 ui.label(lang.tr("Показать:", "Show:"));
                 egui::ComboBox::from_id_salt("status_filter_cb")
                     .width(150.0)
@@ -1299,7 +1543,6 @@ impl eframe::App for ReStemApp {
 
                 ui.separator();
 
-                // Выбор поля и направления сортировки
                 ui.strong(lang.tr("Сортировка:", "Sort by:"));
                 egui::ComboBox::from_id_salt("sort_field_cb")
                     .width(175.0)
@@ -1395,142 +1638,239 @@ impl eframe::App for ReStemApp {
             });
         });
 
-        // --- ЛЕВАЯ КОЛОНКА: ДЕРЕВО ПАПОК И ШАБЛОНЫ ---
+        // --- ЛЕВАЯ КОЛОНКА: ПАПКИ, ШАБЛОНЫ И ПРЕДПРОСМОТР ФАЙЛА ---
         egui::SidePanel::left("left_explorer_panel")
             .resizable(true)
-            .default_width(225.0)
-            .width_range(175.0..=340.0)
+            .default_width(255.0)
+            .width_range(210.0..=380.0)
             .show(ctx, |ui| {
-                ui.add_space(4.0);
-                ui.heading(lang.tr("Папки", "Folders"));
-                ui.separator();
+                egui::ScrollArea::vertical()
+                    .id_salt("left_panel_main_scroll")
+                    .show(ui, |ui| {
+                        ui.add_space(4.0);
+                        ui.heading(lang.tr("Папки", "Folders"));
+                        ui.separator();
 
-                if let Some(curr) = &self.current_dir {
-                    if let Some(parent) = curr.parent() {
+                        if let Some(curr) = &self.current_dir {
+                            if let Some(parent) = curr.parent() {
+                                if ui
+                                    .button(lang.tr("⬆ На уровень вверх (..)", "⬆ Up one level (..)"))
+                                    .clicked()
+                                {
+                                    navigate_to = Some(parent.to_path_buf());
+                                }
+                            }
+                            let curr_name = curr
+                                .file_name()
+                                .map(|n| n.to_string_lossy().to_string())
+                                .unwrap_or_else(|| curr.display().to_string());
+                            ui.strong(format!("📂 {}", curr_name));
+                        } else {
+                            ui.weak(lang.tr(
+                                "Нажмите «Открыть папку» или перетащите каталог сюда",
+                                "Click 'Add Folder' or drag a folder here",
+                            ));
+                        }
+
+                        egui::ScrollArea::vertical()
+                            .id_salt("folders_sub_scroll")
+                            .max_height(155.0)
+                            .show(ui, |ui| {
+                                for sub in &self.subfolders {
+                                    let name = sub
+                                        .file_name()
+                                        .unwrap_or_default()
+                                        .to_string_lossy()
+                                        .to_string();
+                                    if ui.selectable_label(false, format!("  📁 {}", name)).clicked()
+                                    {
+                                        navigate_to = Some(sub.clone());
+                                    }
+                                }
+                            });
+
+                        ui.add_space(10.0);
+                        ui.heading(lang.tr("Предпросмотр объекта", "Item Preview"));
+                        ui.separator();
+
+                        ui.group(|ui| {
+                            ui.set_min_width(ui.available_width());
+                            match &self.preview_state {
+                                PreviewState::Empty => {
+                                    ui.weak(lang.tr(
+                                        "Кликните по любому файлу или папке в таблице для предпросмотра картинки или текста.",
+                                        "Click any file or folder in the table to preview image or text.",
+                                    ));
+                                }
+                                PreviewState::Folder { name, items_count } => {
+                                    ui.strong(format!("📁 {}", name));
+                                    ui.label(match lang {
+                                        Lang::Ru => format!("Объектов внутри: {}", items_count),
+                                        Lang::En => format!("Items inside: {}", items_count),
+                                    });
+                                    if let Some(sel) = &self.selected_path {
+                                        if ui
+                                            .button(lang.tr(
+                                                "📂 Войти в эту папку",
+                                                "📂 Open this folder",
+                                            ))
+                                            .clicked()
+                                        {
+                                            navigate_to = Some(sel.clone());
+                                        }
+                                    }
+                                }
+                                PreviewState::Image {
+                                    name,
+                                    texture,
+                                    orig_w,
+                                    orig_h,
+                                    tex_size,
+                                } => {
+                                    ui.strong(format!("🖼 {}", name));
+                                    ui.weak(format!("{} × {} px", orig_w, orig_h));
+                                    let max_w = ui.available_width().max(80.0);
+                                    let max_h = 185.0;
+                                    let scale =
+                                        (max_w / tex_size.x).min(max_h / tex_size.y).min(1.0);
+                                    let draw_size = *tex_size * scale;
+                                    let (rect, _) =
+                                        ui.allocate_exact_size(draw_size, egui::Sense::hover());
+                                    ui.painter().image(
+                                        texture.id(),
+                                        rect,
+                                        egui::Rect::from_min_max(
+                                            egui::pos2(0.0, 0.0),
+                                            egui::pos2(1.0, 1.0),
+                                        ),
+                                        egui::Color32::WHITE,
+                                    );
+                                }
+                                PreviewState::Text {
+                                    name,
+                                    content,
+                                    truncated,
+                                } => {
+                                    ui.strong(format!("📄 {}", name));
+                                    if *truncated {
+                                        ui.weak(lang.tr(
+                                            "Показаны первые 4 КБ текста:",
+                                            "Showing first 4 KB of text:",
+                                        ));
+                                    }
+                                    egui::ScrollArea::vertical()
+                                        .id_salt("text_preview_scroll")
+                                        .max_height(165.0)
+                                        .show(ui, |ui| {
+                                            ui.add(
+                                                egui::Label::new(
+                                                    egui::RichText::new(content)
+                                                        .monospace()
+                                                        .size(11.5),
+                                                )
+                                                .wrap(),
+                                            );
+                                        });
+                                }
+                                PreviewState::BinaryOrOther { name, info } => {
+                                    ui.strong(format!("📄 {}", name));
+                                    ui.weak(info);
+                                }
+                            }
+
+                            if let Some(sel_path) = &self.selected_path {
+                                ui.add_space(6.0);
+                                if ui
+                                    .button(lang.tr(
+                                        "🗑 Удалить этот объект в Корзину",
+                                        "🗑 Move this item to Recycle Bin",
+                                    ))
+                                    .clicked()
+                                {
+                                    single_trash_target = Some(sel_path.clone());
+                                }
+                            }
+                        });
+
+                        ui.add_space(10.0);
+                        ui.heading(lang.tr("Шаблоны правил", "Saved Presets"));
+                        ui.separator();
+
                         if ui
-                            .button(lang.tr("⬆ На уровень вверх (..)", "⬆ Up one level (..)"))
+                            .button(lang.tr(
+                                "🔹 Транслитерация + без пробелов",
+                                "🔹 Transliterate RU → LAT + _",
+                            ))
                             .clicked()
                         {
-                            navigate_to = Some(parent.to_path_buf());
+                            self.transliterate = true;
+                            self.find_str = " ".to_string();
+                            self.replace_str = "_".to_string();
+                            self.use_regex = false;
+                            needs_recalc = true;
                         }
-                    }
-                    let curr_name = curr
-                        .file_name()
-                        .map(|n| n.to_string_lossy().to_string())
-                        .unwrap_or_else(|| curr.display().to_string());
-                    ui.strong(format!("📂 {}", curr_name));
-                } else {
-                    ui.weak(lang.tr(
-                        "Нажмите «Открыть папку» или перетащите каталог сюда",
-                        "Click 'Add Folder' or drag a folder here",
-                    ));
-                }
+                        if ui
+                            .button(lang.tr(
+                                "🔹 Пробелы → подчёркивания (_)",
+                                "🔹 Spaces to underscores (_)",
+                            ))
+                            .clicked()
+                        {
+                            self.find_str = " ".to_string();
+                            self.replace_str = "_".to_string();
+                            self.use_regex = false;
+                            needs_recalc = true;
+                        }
+                        if ui
+                            .button(lang.tr(
+                                "🔹 Нумерация по дате съёмки/изм.",
+                                "🔹 Sequence sorted by date",
+                            ))
+                            .clicked()
+                        {
+                            self.sort_field = SortField::ModifiedDate;
+                            self.sort_asc = true;
+                            self.num_mode = NumMode::Prefix;
+                            self.num_start = 1;
+                            self.num_pad = 3;
+                            self.num_sep = "_".to_string();
+                            needs_recalc = true;
+                        }
+                        if ui
+                            .button(lang.tr(
+                                "🔹 Строчные имена и расширения",
+                                "🔹 Lowercase name & extension",
+                            ))
+                            .clicked()
+                        {
+                            self.case_mode = CaseMode::Lower;
+                            self.ext_mode = ExtMode::Lower;
+                            needs_recalc = true;
+                        }
+                        if ui
+                            .button(lang.tr(
+                                "🔹 Убрать копии « (1)», « (2)»",
+                                "🔹 Remove ' (1)', ' (2)' copies",
+                            ))
+                            .clicked()
+                        {
+                            self.find_str = r"\s*\(\d+\)".to_string();
+                            self.replace_str = String::new();
+                            self.use_regex = true;
+                            needs_recalc = true;
+                        }
 
-                egui::ScrollArea::vertical()
-                    .id_salt("folders_scroll")
-                    .max_height(250.0)
-                    .show(ui, |ui| {
-                        for sub in &self.subfolders {
-                            let name = sub
-                                .file_name()
-                                .unwrap_or_default()
-                                .to_string_lossy()
-                                .to_string();
-                            if ui.selectable_label(false, format!("  📁 {}", name)).clicked() {
-                                navigate_to = Some(sub.clone());
-                            }
+                        ui.add_space(6.0);
+                        if ui
+                            .button(lang.tr(
+                                "✖ Сбросить все правила и фильтры",
+                                "✖ Reset All Rules & Filters",
+                            ))
+                            .clicked()
+                        {
+                            trigger_reset = true;
                         }
                     });
-
-                ui.add_space(12.0);
-                ui.heading(lang.tr("Шаблоны правил", "Saved Presets"));
-                ui.separator();
-                ui.weak(lang.tr("Быстрые настройки в 1 клик:", "One-click presets:"));
-                ui.add_space(4.0);
-
-                if ui
-                    .button(lang.tr(
-                        "🔹 Транслитерация + без пробелов",
-                        "🔹 Transliterate RU → LAT + _",
-                    ))
-                    .clicked()
-                {
-                    self.transliterate = true;
-                    self.find_str = " ".to_string();
-                    self.replace_str = "_".to_string();
-                    self.use_regex = false;
-                    needs_recalc = true;
-                }
-                if ui
-                    .button(lang.tr(
-                        "🔹 Пробелы → подчёркивания (_)",
-                        "🔹 Spaces to underscores (_)",
-                    ))
-                    .clicked()
-                {
-                    self.find_str = " ".to_string();
-                    self.replace_str = "_".to_string();
-                    self.use_regex = false;
-                    needs_recalc = true;
-                }
-                if ui
-                    .button(lang.tr(
-                        "🔹 Подчёркивания (_) → пробелы",
-                        "🔹 Underscores (_) to spaces",
-                    ))
-                    .clicked()
-                {
-                    self.find_str = "_".to_string();
-                    self.replace_str = " ".to_string();
-                    self.use_regex = false;
-                    needs_recalc = true;
-                }
-                if ui
-                    .button(lang.tr(
-                        "🔹 Нумерация по дате съёмки/изм.",
-                        "🔹 Sequence sorted by date",
-                    ))
-                    .clicked()
-                {
-                    self.sort_field = SortField::ModifiedDate;
-                    self.sort_asc = true;
-                    self.num_mode = NumMode::Prefix;
-                    self.num_start = 1;
-                    self.num_pad = 3;
-                    self.num_sep = "_".to_string();
-                    needs_recalc = true;
-                }
-                if ui
-                    .button(lang.tr(
-                        "🔹 Строчные имена и расширения",
-                        "🔹 Lowercase name & extension",
-                    ))
-                    .clicked()
-                {
-                    self.case_mode = CaseMode::Lower;
-                    self.ext_mode = ExtMode::Lower;
-                    needs_recalc = true;
-                }
-                if ui
-                    .button(lang.tr(
-                        "🔹 Убрать копии « (1)», « (2)»",
-                        "🔹 Remove ' (1)', ' (2)' copies",
-                    ))
-                    .clicked()
-                {
-                    self.find_str = r"\s*\(\d+\)".to_string();
-                    self.replace_str = String::new();
-                    self.use_regex = true;
-                    needs_recalc = true;
-                }
-
-                ui.add_space(8.0);
-                if ui
-                    .button(lang.tr("✖ Сбросить все правила и фильтры", "✖ Reset All Rules & Filters"))
-                    .clicked()
-                {
-                    trigger_reset = true;
-                }
             });
 
         // --- ПРАВАЯ КОЛОНКА: ИНСПЕКТОР ПРАВИЛ И ФИЛЬТРОВ ---
@@ -1546,7 +1886,6 @@ impl eframe::App for ReStemApp {
                 egui::ScrollArea::vertical()
                     .id_salt("rules_scroll")
                     .show(ui, |ui| {
-                        // 1. Поиск и замена
                         ui.group(|ui| {
                             ui.strong(lang.tr("1. Поиск и замена", "1. Find & Replace"));
                             ui.add_space(2.0);
@@ -1570,7 +1909,6 @@ impl eframe::App for ReStemApp {
 
                         ui.add_space(6.0);
 
-                        // 2. Регистр и транслитерация
                         ui.group(|ui| {
                             ui.strong(lang.tr(
                                 "2. Регистр и транслитерация",
@@ -1647,7 +1985,6 @@ impl eframe::App for ReStemApp {
 
                         ui.add_space(6.0);
 
-                        // 3. Префикс, суффикс и обрезка
                         ui.group(|ui| {
                             ui.strong(lang.tr(
                                 "3. Префикс, суффикс и обрезка",
@@ -1679,7 +2016,6 @@ impl eframe::App for ReStemApp {
 
                         ui.add_space(6.0);
 
-                        // 4. Нумерация
                         ui.group(|ui| {
                             ui.strong(lang.tr(
                                 "4. Нумерация (по порядку сортировки)",
@@ -1766,7 +2102,6 @@ impl eframe::App for ReStemApp {
 
                         ui.add_space(6.0);
 
-                        // 5. Управление расширениями
                         ui.group(|ui| {
                             ui.strong(lang.tr("5. Расширения файлов", "5. File Extensions"));
                             ui.add_space(2.0);
@@ -1826,7 +2161,6 @@ impl eframe::App for ReStemApp {
 
                         ui.add_space(6.0);
 
-                        // 6. Расширенная фильтрация
                         ui.group(|ui| {
                             ui.strong(lang.tr(
                                 "6. Фильтры и исключения",
@@ -1950,6 +2284,9 @@ impl eframe::App for ReStemApp {
 
         // --- ЦЕНТРАЛЬНАЯ ТАБЛИЦА ПРЕДПРОСМОТРА ---
         egui::CentralPanel::default().show(ctx, |ui| {
+            if let Some(target) = single_trash_target {
+                self.delete_paths_to_trash(vec![target]);
+            }
             if let Some(folder) = navigate_to {
                 self.open_new_directory(folder);
             } else if needs_reload {
@@ -1973,8 +2310,8 @@ impl eframe::App for ReStemApp {
             ui.horizontal(|ui| {
                 ui.heading(lang.tr("Файлы и папки для переименования", "Files to Rename"));
                 ui.weak(lang.tr(
-                    "(кликните по заголовку столбца для быстрой сортировки)",
-                    "(click column headers to sort)",
+                    "(клик по имени — предпросмотр картинки/текста, клик по шапке — сортировка)",
+                    "(click name to preview image/text, click header to sort)",
                 ));
             });
             ui.add_space(4.0);
@@ -2017,6 +2354,7 @@ impl eframe::App for ReStemApp {
             let label_file = lang.tr("📄 Файл", "📄 File");
 
             let is_dark = self.dark_mode;
+            let current_selected = self.selected_path.clone();
 
             TableBuilder::new(ui)
                 .striped(true)
@@ -2067,6 +2405,8 @@ impl eframe::App for ReStemApp {
                     body.rows(24.0, self.preview_rows.len(), |mut row| {
                         let item = &self.preview_rows[row.index()];
                         let muted = egui::Color32::from_gray(130);
+                        let is_selected =
+                            current_selected.as_ref() == Some(&item.old_path);
 
                         row.col(|ui| {
                             let mut inc = item.included;
@@ -2096,10 +2436,13 @@ impl eframe::App for ReStemApp {
                             } else {
                                 item.old_name.clone()
                             };
-                            if item.included {
-                                ui.label(display_orig);
+                            let text = if item.included {
+                                egui::RichText::new(display_orig)
                             } else {
-                                ui.colored_label(muted, display_orig);
+                                egui::RichText::new(display_orig).color(muted)
+                            };
+                            if ui.selectable_label(is_selected, text).clicked() {
+                                inspect_target = Some(item.old_path.clone());
                             }
                         });
 
@@ -2155,7 +2498,9 @@ impl eframe::App for ReStemApp {
                     });
                 });
 
-            if let Some(col_field) = clicked_sort_col {
+            if let Some(target_path) = inspect_target {
+                self.select_for_preview(target_path, ctx);
+            } else if let Some(col_field) = clicked_sort_col {
                 self.toggle_column_sort(col_field);
             } else if let Some(select_all) = toggle_all {
                 if select_all {
