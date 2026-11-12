@@ -3,18 +3,20 @@
 use eframe::egui;
 use egui_extras::{Column, TableBuilder};
 use regex::RegexBuilder;
+use std::cmp::Ordering;
 use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::UNIX_EPOCH;
 
 fn main() -> eframe::Result<()> {
     let icon = build_app_icon();
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("ReStem — Пакетное переименование файлов и папок")
-            .with_inner_size([1240.0, 760.0])
-            .with_min_inner_size([960.0, 560.0])
+            .with_inner_size([1320.0, 800.0])
+            .with_min_inner_size([1020.0, 600.0])
             .with_drag_and_drop(true)
             .with_icon(Arc::new(icon)),
         ..Default::default()
@@ -40,7 +42,10 @@ fn build_app_icon() -> egui::IconData {
             let dx = (x as f32 - 15.5).abs();
             let dy = (y as f32 - 15.5).abs();
 
-            if dx < 14.5 && dy < 14.5 && (dx < 11.5 || dy < 11.5 || (dx - 11.5).hypot(dy - 11.5) <= 3.0) {
+            if dx < 14.5
+                && dy < 14.5
+                && (dx < 11.5 || dy < 11.5 || (dx - 11.5).hypot(dy - 11.5) <= 3.0)
+            {
                 rgba[idx] = 20;
                 rgba[idx + 1] = 30;
                 rgba[idx + 2] = 48;
@@ -70,6 +75,126 @@ fn build_app_icon() -> egui::IconData {
     }
 }
 
+/// Умная («натуральная») сортировка строк с учётом чисел (file2 < file10)
+fn natural_cmp(a: &str, b: &str) -> Ordering {
+    let mut ia = a.chars().peekable();
+    let mut ib = b.chars().peekable();
+
+    while let (Some(&ca), Some(&cb)) = (ia.peek(), ib.peek()) {
+        if ca.is_ascii_digit() && cb.is_ascii_digit() {
+            let mut na = String::new();
+            while let Some(&c) = ia.peek() {
+                if c.is_ascii_digit() {
+                    na.push(c);
+                    ia.next();
+                } else {
+                    break;
+                }
+            }
+            let mut nb = String::new();
+            while let Some(&c) = ib.peek() {
+                if c.is_ascii_digit() {
+                    nb.push(c);
+                    ib.next();
+                } else {
+                    break;
+                }
+            }
+            let va = na.trim_start_matches('0');
+            let vb = nb.trim_start_matches('0');
+            let ord = va
+                .len()
+                .cmp(&vb.len())
+                .then_with(|| va.cmp(vb))
+                .then_with(|| na.len().cmp(&nb.len()));
+            if ord != Ordering::Equal {
+                return ord;
+            }
+        } else {
+            let ua = ca.to_lowercase().next().unwrap_or(ca);
+            let ub = cb.to_lowercase().next().unwrap_or(cb);
+            let ord = ua.cmp(&ub);
+            if ord != Ordering::Equal {
+                return ord;
+            }
+            ia.next();
+            ib.next();
+        }
+    }
+    ia.count().cmp(&ib.count())
+}
+
+/// Форматирование UNIX-времени в строку ГГГГ-ММ-ДД ЧЧ:ММ
+fn format_timestamp(secs: u64) -> String {
+    if secs == 0 {
+        return "—".to_string();
+    }
+    let days = (secs / 86400) as i64;
+    let rem = secs % 86400;
+    let hours = rem / 3600;
+    let mins = (rem % 3600) / 60;
+
+    let z = days + 719468;
+    let era = if z >= 0 { z } else { z - 146096 } / 146097;
+    let doe = (z - era * 146097) as u32;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = if m <= 2 { y + 1 } else { y };
+
+    format!("{:04}-{:02}-{:02} {:02}:{:02}", year, m, d, hours, mins)
+}
+
+/// Транслитерация кириллицы (RU -> LAT) с сохранением регистра
+fn transliterate_cyrillic(input: &str) -> String {
+    let mut out = String::with_capacity(input.len() * 2);
+    for ch in input.chars() {
+        let replacement = match ch {
+            'а' => "a",  'А' => "A",
+            'б' => "b",  'Б' => "B",
+            'в' => "v",  'В' => "V",
+            'г' => "g",  'Г' => "G",
+            'д' => "d",  'Д' => "D",
+            'е' => "e",  'Е' => "E",
+            'ё' => "yo", 'Ё' => "Yo",
+            'ж' => "zh", 'Ж' => "Zh",
+            'з' => "z",  'З' => "Z",
+            'и' => "i",  'И' => "I",
+            'й' => "y",  'Й' => "Y",
+            'к' => "k",  'К' => "K",
+            'л' => "l",  'Л' => "L",
+            'м' => "m",  'М' => "M",
+            'н' => "n",  'Н' => "N",
+            'о' => "o",  'О' => "O",
+            'п' => "p",  'П' => "P",
+            'р' => "r",  'Р' => "R",
+            'с' => "s",  'С' => "S",
+            'т' => "t",  'Т' => "T",
+            'у' => "u",  'У' => "U",
+            'ф' => "f",  'Ф' => "F",
+            'х' => "kh", 'Х' => "Kh",
+            'ц' => "ts", 'Ц' => "Ts",
+            'ч' => "ch", 'Ч' => "Ch",
+            'ш' => "sh", 'Ш' => "Sh",
+            'щ' => "shch", 'Щ' => "Shch",
+            'ъ' | 'Ъ' | 'ь' | 'Ь' => "",
+            'ы' => "y",  'Ы' => "Y",
+            'э' => "e",  'Э' => "E",
+            'ю' => "yu", 'Ю' => "Yu",
+            'я' => "ya", 'Я' => "Ya",
+            _ => {
+                out.push(ch);
+                continue;
+            }
+        };
+        out.push_str(replacement);
+    }
+    out
+}
+
 #[derive(PartialEq, Clone, Copy)]
 enum Lang {
     Ru,
@@ -83,6 +208,32 @@ impl Lang {
             Lang::En => en,
         }
     }
+}
+
+#[derive(PartialEq, Clone, Copy)]
+enum SortField {
+    NaturalName,
+    AlphaName,
+    ModifiedDate,
+    Size,
+    Extension,
+    FolderPath,
+}
+
+#[derive(PartialEq, Clone, Copy)]
+enum StatusFilter {
+    All,
+    OnlyChanged,
+    OnlyIncluded,
+    OnlyUnchanged,
+}
+
+#[derive(PartialEq, Clone, Copy)]
+enum SizeFilterMode {
+    Any,
+    GreaterThanKB,
+    LessThanKB,
+    BetweenKB,
 }
 
 #[derive(PartialEq, Clone, Copy)]
@@ -101,14 +252,26 @@ enum NumMode {
     Prefix,
 }
 
+#[derive(PartialEq, Clone, Copy)]
+enum ExtMode {
+    Keep,
+    Lower,
+    Upper,
+    Remove,
+}
+
 #[derive(Clone)]
 struct FsEntry {
     path: PathBuf,
     parent_dir: PathBuf,
     rel_parent: String,
+    name: String,
+    ext_lower: String,
     is_dir: bool,
+    is_hidden: bool,
     depth: usize,
     size: u64,
+    modified_ts: u64,
 }
 
 #[derive(Clone)]
@@ -119,6 +282,7 @@ struct PreviewRow {
     is_dir: bool,
     depth: usize,
     size: u64,
+    modified_ts: u64,
     old_name: String,
     new_name: String,
     included: bool,
@@ -136,29 +300,56 @@ struct ReStemApp {
     excluded_paths: HashSet<PathBuf>,
     undo_history: Vec<(PathBuf, PathBuf)>,
 
+    // Настройки сортировки
+    sort_field: SortField,
+    sort_asc: bool,
+    folders_first: bool,
+
+    // Быстрые фильтры верхней панели
     search_query: String,
+    search_regex: bool,
+    search_case_sensitive: bool,
+    status_filter: StatusFilter,
     include_files: bool,
     include_dirs: bool,
     recursive: bool,
-    ext_filter: String,
+    hide_system_hidden: bool,
 
+    // Расширенные фильтры (Блок 6)
+    ext_filter: String,
+    ext_exclude_filter: String,
+    exclude_words_filter: String,
+    size_filter_mode: SizeFilterMode,
+    size_min_kb: u64,
+    size_max_kb: u64,
+
+    // 1. Поиск и замена
     find_str: String,
     replace_str: String,
     use_regex: bool,
     case_sensitive: bool,
 
+    // 2. Регистр и транслитерация
+    case_mode: CaseMode,
+    transliterate: bool,
+
+    // 3. Префикс, суффикс и обрезка
     prefix: String,
     suffix: String,
     trim_start: usize,
     trim_end: usize,
 
-    case_mode: CaseMode,
+    // 4. Нумерация
     num_mode: NumMode,
     num_start: usize,
     num_step: usize,
     num_pad: usize,
     num_sep: String,
     reset_num_per_dir: bool,
+
+    // 5. Расширение файлов
+    ext_mode: ExtMode,
+    new_ext: String,
 
     status_msg: String,
 }
@@ -174,26 +365,45 @@ impl Default for ReStemApp {
             preview_rows: Vec::new(),
             excluded_paths: HashSet::new(),
             undo_history: Vec::new(),
+
+            sort_field: SortField::NaturalName,
+            sort_asc: true,
+            folders_first: true,
+
             search_query: String::new(),
+            search_regex: false,
+            search_case_sensitive: false,
+            status_filter: StatusFilter::All,
             include_files: true,
             include_dirs: true,
             recursive: false,
+            hide_system_hidden: true,
+
             ext_filter: String::new(),
+            ext_exclude_filter: String::new(),
+            exclude_words_filter: String::new(),
+            size_filter_mode: SizeFilterMode::Any,
+            size_min_kb: 100,
+            size_max_kb: 10240,
+
             find_str: String::new(),
             replace_str: String::new(),
             use_regex: false,
             case_sensitive: true,
+            case_mode: CaseMode::None,
+            transliterate: false,
             prefix: String::new(),
             suffix: String::new(),
             trim_start: 0,
             trim_end: 0,
-            case_mode: CaseMode::None,
             num_mode: NumMode::None,
             num_start: 1,
             num_step: 1,
             num_pad: 2,
             num_sep: "_".to_string(),
             reset_num_per_dir: true,
+            ext_mode: ExtMode::Keep,
+            new_ext: String::new(),
             status_msg: "Выберите папку или перетащите её мышью в окно программы.".to_string(),
         }
     }
@@ -213,6 +423,33 @@ impl ReStemApp {
         }
     }
 
+    fn is_entry_hidden(path: &Path, meta: Option<&fs::Metadata>) -> bool {
+        let name = path
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy();
+        if name.starts_with('.')
+            || name.eq_ignore_ascii_case("node_modules")
+            || name.eq_ignore_ascii_case("$RECYCLE.BIN")
+            || name.eq_ignore_ascii_case("System Volume Information")
+        {
+            return true;
+        }
+        #[cfg(windows)]
+        if let Some(m) = meta {
+            use std::os::windows::fs::MetadataExt;
+            let attrs = m.file_attributes();
+            // FILE_ATTRIBUTE_HIDDEN (0x2) | FILE_ATTRIBUTE_SYSTEM (0x4)
+            if (attrs & 0x2) != 0 || (attrs & 0x4) != 0 {
+                return true;
+            }
+        }
+        #[cfg(not(windows))]
+        let _ = meta;
+
+        false
+    }
+
     fn open_new_directory(&mut self, root_dir: PathBuf) {
         if self.current_dir.as_ref() != Some(&root_dir) {
             self.excluded_paths.clear();
@@ -228,40 +465,22 @@ impl ReStemApp {
             for e in read_top.flatten() {
                 let p = e.path();
                 if p.is_dir() {
+                    let meta = e.metadata().ok();
+                    if self.hide_system_hidden && Self::is_entry_hidden(&p, meta.as_ref()) {
+                        continue;
+                    }
                     subs.push(p);
                 }
             }
         }
-        subs.sort_by_key(|p| {
-            p.file_name()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .to_lowercase()
+        subs.sort_by(|a, b| {
+            let na = a.file_name().unwrap_or_default().to_string_lossy();
+            let nb = b.file_name().unwrap_or_default().to_string_lossy();
+            natural_cmp(&na, &nb)
         });
         self.subfolders = subs;
 
         self.collect_entries(&root_dir, &root_dir, 0, &mut entries);
-
-        entries.sort_by(|a, b| {
-            a.rel_parent
-                .to_lowercase()
-                .cmp(&b.rel_parent.to_lowercase())
-                .then_with(|| b.is_dir.cmp(&a.is_dir))
-                .then_with(|| {
-                    a.path
-                        .file_name()
-                        .unwrap_or_default()
-                        .to_string_lossy()
-                        .to_lowercase()
-                        .cmp(
-                            &b.path
-                                .file_name()
-                                .unwrap_or_default()
-                                .to_string_lossy()
-                                .to_lowercase(),
-                        )
-                })
-        });
 
         self.current_dir = Some(root_dir);
         self.all_entries = entries;
@@ -279,25 +498,26 @@ impl ReStemApp {
             return;
         };
 
-        let mut local_entries: Vec<(PathBuf, u64, bool)> = read_dir
-            .flatten()
-            .map(|e| {
-                let path = e.path();
-                let meta = e.metadata().ok();
-                let is_dir = meta.as_ref().map(|m| m.is_dir()).unwrap_or_else(|| path.is_dir());
-                let size = meta.as_ref().map(|m| m.len()).unwrap_or(0);
-                (path, size, is_dir)
-            })
-            .collect();
+        for entry in read_dir.flatten() {
+            let path = entry.path();
+            let meta = entry.metadata().ok();
+            let is_dir = meta
+                .as_ref()
+                .map(|m| m.is_dir())
+                .unwrap_or_else(|| path.is_dir());
+            let size = meta.as_ref().map(|m| m.len()).unwrap_or(0);
+            let modified_ts = meta
+                .as_ref()
+                .and_then(|m| m.modified().ok())
+                .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
 
-        local_entries.sort_by_key(|(p, _, _)| {
-            p.file_name()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .to_lowercase()
-        });
+            let is_hidden = Self::is_entry_hidden(&path, meta.as_ref());
+            if self.hide_system_hidden && is_hidden {
+                continue;
+            }
 
-        for (path, size, is_dir) in local_entries {
             let parent_dir = path.parent().unwrap_or(root).to_path_buf();
             let rel_parent = parent_dir
                 .strip_prefix(root)
@@ -311,13 +531,32 @@ impl ReStemApp {
                 rel_parent
             };
 
+            let name = path
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_string();
+
+            let ext_lower = if is_dir {
+                String::new()
+            } else {
+                path.extension()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .to_lowercase()
+            };
+
             out.push(FsEntry {
                 path: path.clone(),
                 parent_dir,
                 rel_parent: rel_display,
+                name,
+                ext_lower,
                 is_dir,
+                is_hidden,
                 depth,
                 size,
+                modified_ts,
             });
 
             if is_dir && self.recursive {
@@ -326,15 +565,54 @@ impl ReStemApp {
         }
     }
 
+    fn compare_entries(&self, a: &FsEntry, b: &FsEntry) -> Ordering {
+        if self.folders_first && a.is_dir != b.is_dir {
+            return b.is_dir.cmp(&a.is_dir);
+        }
+
+        let base_ord = match self.sort_field {
+            SortField::NaturalName => natural_cmp(&a.name, &b.name),
+            SortField::AlphaName => a
+                .name
+                .to_lowercase()
+                .cmp(&b.name.to_lowercase())
+                .then_with(|| a.name.cmp(&b.name)),
+            SortField::ModifiedDate => a
+                .modified_ts
+                .cmp(&b.modified_ts)
+                .then_with(|| natural_cmp(&a.name, &b.name)),
+            SortField::Size => a
+                .size
+                .cmp(&b.size)
+                .then_with(|| natural_cmp(&a.name, &b.name)),
+            SortField::Extension => a
+                .ext_lower
+                .cmp(&b.ext_lower)
+                .then_with(|| natural_cmp(&a.name, &b.name)),
+            SortField::FolderPath => natural_cmp(&a.rel_parent, &b.rel_parent)
+                .then_with(|| natural_cmp(&a.name, &b.name)),
+        };
+
+        if self.sort_asc {
+            base_ord
+        } else {
+            base_ord.reverse()
+        }
+    }
+
+    fn toggle_column_sort(&mut self, field: SortField) {
+        if self.sort_field == field {
+            self.sort_asc = !self.sort_asc;
+        } else {
+            self.sort_field = field;
+            self.sort_asc = true;
+        }
+        self.recalculate_preview();
+    }
+
     fn compute_new_name(&self, entry: &FsEntry, idx: usize) -> String {
-        let (mut stem, ext) = if entry.is_dir {
-            let full_name = entry
-                .path
-                .file_name()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .to_string();
-            (full_name, String::new())
+        let (mut stem, raw_ext) = if entry.is_dir {
+            (entry.name.clone(), String::new())
         } else {
             let s = entry
                 .path
@@ -345,16 +623,18 @@ impl ReStemApp {
             let e = entry
                 .path
                 .extension()
-                .map(|ext_os| format!(".{}", ext_os.to_string_lossy()))
+                .map(|ext_os| ext_os.to_string_lossy().to_string())
                 .unwrap_or_default();
             (s, e)
         };
 
+        // 1. Обрезка символов по краям
         let chars: Vec<char> = stem.chars().collect();
         let start = self.trim_start.min(chars.len());
         let end = chars.len().saturating_sub(self.trim_end).max(start);
         stem = chars[start..end].iter().collect();
 
+        // 2. Поиск и замена
         if !self.find_str.is_empty() {
             let pattern = if self.use_regex {
                 self.find_str.clone()
@@ -369,8 +649,15 @@ impl ReStemApp {
             }
         }
 
+        // 3. Префикс и суффикс
         stem = format!("{}{}{}", self.prefix, stem, self.suffix);
 
+        // 4. Транслитерация кириллицы (RU -> LAT)
+        if self.transliterate {
+            stem = transliterate_cyrillic(&stem);
+        }
+
+        // 5. Изменение регистра
         stem = match self.case_mode {
             CaseMode::None => stem,
             CaseMode::Lower => stem.to_lowercase(),
@@ -390,24 +677,60 @@ impl ReStemApp {
                     let mut c = w.chars();
                     match c.next() {
                         None => String::new(),
-                        Some(f) => f.to_uppercase().collect::<String>() + &c.as_str().to_lowercase(),
+                        Some(f) => {
+                            f.to_uppercase().collect::<String>() + &c.as_str().to_lowercase()
+                        }
                     }
                 })
                 .collect::<Vec<_>>()
                 .join(" "),
         };
 
+        // 6. Нумерация
         if self.num_mode != NumMode::None {
             let num = self.num_start + idx * self.num_step.max(1);
             let num_str = format!("{:0width$}", num, width = self.num_pad.max(1));
             stem = match self.num_mode {
-                NumMode::Suffix if !stem.is_empty() => format!("{}{}{}", stem, self.num_sep, num_str),
-                NumMode::Prefix if !stem.is_empty() => format!("{}{}{}", num_str, self.num_sep, stem),
+                NumMode::Suffix if !stem.is_empty() => {
+                    format!("{}{}{}", stem, self.num_sep, num_str)
+                }
+                NumMode::Prefix if !stem.is_empty() => {
+                    format!("{}{}{}", num_str, self.num_sep, stem)
+                }
                 _ => num_str,
             };
         }
 
-        format!("{}{}", stem, ext)
+        // 7. Обработка расширения (только для файлов)
+        let final_ext = if entry.is_dir {
+            String::new()
+        } else {
+            let custom_clean = self.new_ext.trim().trim_start_matches('.');
+            let mut ext_val = if !custom_clean.is_empty() {
+                custom_clean.to_string()
+            } else {
+                raw_ext
+            };
+
+            if self.transliterate {
+                ext_val = transliterate_cyrillic(&ext_val);
+            }
+
+            ext_val = match self.ext_mode {
+                ExtMode::Keep => ext_val,
+                ExtMode::Lower => ext_val.to_lowercase(),
+                ExtMode::Upper => ext_val.to_uppercase(),
+                ExtMode::Remove => String::new(),
+            };
+
+            if ext_val.is_empty() {
+                String::new()
+            } else {
+                format!(".{}", ext_val)
+            }
+        };
+
+        format!("{}{}", stem, final_ext)
     }
 
     fn recalculate_preview(&mut self) {
@@ -418,77 +741,153 @@ impl ReStemApp {
             .filter(|s| !s.is_empty())
             .collect();
 
-        let search_lower = self.search_query.trim().to_lowercase();
+        let excluded_exts: Vec<String> = self
+            .ext_exclude_filter
+            .split(',')
+            .map(|s| s.trim().trim_start_matches('.').to_lowercase())
+            .filter(|s| !s.is_empty())
+            .collect();
 
-        let filtered: Vec<&FsEntry> = self
+        let excluded_words: Vec<String> = self
+            .exclude_words_filter
+            .split(',')
+            .map(|s| s.trim().to_lowercase())
+            .filter(|s| !s.is_empty())
+            .collect();
+
+        let search_trimmed = self.search_query.trim();
+        let search_re = if !search_trimmed.is_empty() {
+            let pat = if self.search_regex {
+                search_trimmed.to_string()
+            } else {
+                regex::escape(search_trimmed)
+            };
+            RegexBuilder::new(&pat)
+                .case_insensitive(!self.search_case_sensitive)
+                .build()
+                .ok()
+        } else {
+            None
+        };
+
+        let mut filtered: Vec<&FsEntry> = self
             .all_entries
             .iter()
             .filter(|e| {
+                if self.hide_system_hidden && e.is_hidden {
+                    return false;
+                }
                 if e.is_dir && !self.include_dirs {
                     return false;
                 }
                 if !e.is_dir && !self.include_files {
                     return false;
                 }
-                if !search_lower.is_empty() {
-                    let name_lower = e
-                        .path
-                        .file_name()
-                        .unwrap_or_default()
-                        .to_string_lossy()
-                        .to_lowercase();
-                    if !name_lower.contains(&search_lower) {
+
+                // Поиск по имени (обычный или Regex)
+                if !search_trimmed.is_empty() {
+                    if let Some(re) = &search_re {
+                        if !re.is_match(&e.name) {
+                            return false;
+                        }
+                    } else {
                         return false;
                     }
                 }
+
+                // Исключающие слова
+                if !excluded_words.is_empty() {
+                    let name_low = e.name.to_lowercase();
+                    if excluded_words.iter().any(|w| name_low.contains(w)) {
+                        return false;
+                    }
+                }
+
+                // Фильтры расширений
                 if !allowed_exts.is_empty() {
-                    if e.is_dir {
+                    if e.is_dir || !allowed_exts.contains(&e.ext_lower) {
                         return false;
                     }
-                    let ext = e
-                        .path
-                        .extension()
-                        .unwrap_or_default()
-                        .to_string_lossy()
-                        .to_lowercase();
-                    return allowed_exts.contains(&ext);
                 }
+                if !excluded_exts.is_empty() && !e.is_dir && excluded_exts.contains(&e.ext_lower) {
+                    return false;
+                }
+
+                // Фильтр по размеру (для файлов)
+                if !e.is_dir {
+                    let min_b = self.size_min_kb.saturating_mul(1024);
+                    let max_b = self.size_max_kb.saturating_mul(1024);
+                    match self.size_filter_mode {
+                        SizeFilterMode::Any => {}
+                        SizeFilterMode::GreaterThanKB => {
+                            if e.size < min_b {
+                                return false;
+                            }
+                        }
+                        SizeFilterMode::LessThanKB => {
+                            if e.size > max_b {
+                                return false;
+                            }
+                        }
+                        SizeFilterMode::BetweenKB => {
+                            if e.size < min_b || e.size > max_b {
+                                return false;
+                            }
+                        }
+                    }
+                }
+
                 true
             })
             .collect();
 
+        // Сортируем отфильтрованный список перед расчётом нумерации
+        filtered.sort_by(|a, b| self.compare_entries(a, b));
+
         self.preview_rows.clear();
         let mut changed_count = 0;
         let mut included_count = 0;
-        let mut last_parent: Option<PathBuf> = None;
-        let mut counter_idx = 0;
+        let mut dir_counters: std::collections::HashMap<PathBuf, usize> =
+            std::collections::HashMap::new();
+        let mut global_counter: usize = 0;
 
         for entry in filtered {
-            if self.reset_num_per_dir {
-                if last_parent.as_ref() != Some(&entry.parent_dir) {
-                    counter_idx = 0;
-                    last_parent = Some(entry.parent_dir.clone());
-                }
-            }
-
-            let old_name = entry
-                .path
-                .file_name()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .to_string();
-
             let included = !self.excluded_paths.contains(&entry.path);
+            let old_name = entry.name.clone();
+
             let new_name = if included {
-                included_count += 1;
-                let computed = self.compute_new_name(entry, counter_idx);
-                counter_idx += 1;
-                computed
+                let idx = if self.reset_num_per_dir {
+                    let c = dir_counters.entry(entry.parent_dir.clone()).or_insert(0);
+                    let current = *c;
+                    *c += 1;
+                    current
+                } else {
+                    let current = global_counter;
+                    global_counter += 1;
+                    current
+                };
+                self.compute_new_name(entry, idx)
             } else {
                 old_name.clone()
             };
 
             let changed = included && old_name != new_name && !new_name.is_empty();
+
+            // Фильтр по итоговому статусу строки
+            let pass_status = match self.status_filter {
+                StatusFilter::All => true,
+                StatusFilter::OnlyChanged => changed,
+                StatusFilter::OnlyIncluded => included,
+                StatusFilter::OnlyUnchanged => !changed,
+            };
+
+            if !pass_status {
+                continue;
+            }
+
+            if included {
+                included_count += 1;
+            }
             if changed {
                 changed_count += 1;
             }
@@ -500,6 +899,7 @@ impl ReStemApp {
                 is_dir: entry.is_dir,
                 depth: entry.depth,
                 size: entry.size,
+                modified_ts: entry.modified_ts,
                 old_name,
                 new_name,
                 included,
@@ -509,14 +909,16 @@ impl ReStemApp {
 
         self.status_msg = match self.lang {
             Lang::Ru => format!(
-                "Всего: {}  |  Выбрано: {}  |  К переименованию: {}",
+                "Показано: {} (из {})  |  Выбрано: {}  |  К переименованию: {}",
                 self.preview_rows.len(),
+                self.all_entries.len(),
                 included_count,
                 changed_count
             ),
             Lang::En => format!(
-                "Total: {}  |  Selected: {}  |  Ready to rename: {}",
+                "Shown: {} (of {})  |  Selected: {}  |  Ready to rename: {}",
                 self.preview_rows.len(),
+                self.all_entries.len(),
                 included_count,
                 changed_count
             ),
@@ -528,16 +930,24 @@ impl ReStemApp {
         self.replace_str.clear();
         self.use_regex = false;
         self.case_sensitive = true;
+        self.case_mode = CaseMode::None;
+        self.transliterate = false;
         self.prefix.clear();
         self.suffix.clear();
         self.trim_start = 0;
         self.trim_end = 0;
-        self.case_mode = CaseMode::None;
         self.num_mode = NumMode::None;
         self.num_start = 1;
         self.num_step = 1;
         self.num_pad = 2;
         self.num_sep = "_".to_string();
+        self.ext_mode = ExtMode::Keep;
+        self.new_ext.clear();
+        self.ext_filter.clear();
+        self.ext_exclude_filter.clear();
+        self.exclude_words_filter.clear();
+        self.size_filter_mode = SizeFilterMode::Any;
+        self.status_filter = StatusFilter::All;
         self.recalculate_preview();
     }
 
@@ -552,8 +962,14 @@ impl ReStemApp {
             let key = (row.parent_dir.clone(), final_name.to_lowercase());
             if !seen.insert(key) {
                 self.status_msg = match self.lang {
-                    Lang::Ru => format!("Ошибка: дубликат имени '{}' в '{}'", final_name, row.rel_parent),
-                    Lang::En => format!("Error: duplicate name '{}' in '{}'", final_name, row.rel_parent),
+                    Lang::Ru => format!(
+                        "Ошибка: дубликат имени '{}' в '{}'",
+                        final_name, row.rel_parent
+                    ),
+                    Lang::En => format!(
+                        "Error: duplicate name '{}' in '{}'",
+                        final_name, row.rel_parent
+                    ),
                 };
                 return;
             }
@@ -566,6 +982,7 @@ impl ReStemApp {
             .cloned()
             .collect();
 
+        // Иерархическая сортировка снизу вверх (от глубоких уровней к корню) для безопасности путей
         to_rename.sort_by(|a, b| {
             b.depth
                 .cmp(&a.depth)
@@ -670,13 +1087,17 @@ impl eframe::App for ReStemApp {
         let mut trigger_apply = false;
         let mut trigger_undo = false;
         let mut trigger_reset = false;
+        let mut clicked_sort_col: Option<SortField> = None;
 
-        // --- ВЕРХНЯЯ ПАНЕЛЬ ИНСТРУМЕНТОВ ---
+        // --- ВЕРХНЯЯ ПАНЕЛЬ ИНСТРУМЕНТОВ И БЫСТРОЙ СОРТИРОВКИ ---
         egui::TopBottomPanel::top("top_toolbar").show(ctx, |ui| {
-            ui.add_space(6.0);
+            ui.add_space(5.0);
+            // Ряд 1: Основные действия, поиск, тема и язык
             ui.horizontal(|ui| {
-                let (rect, _) = ui.allocate_exact_size(egui::vec2(24.0, 24.0), egui::Sense::hover());
-                ui.painter().rect_filled(rect, 5.0, egui::Color32::from_rgb(20, 30, 48));
+                let (rect, _) =
+                    ui.allocate_exact_size(egui::vec2(24.0, 24.0), egui::Sense::hover());
+                ui.painter()
+                    .rect_filled(rect, 5.0, egui::Color32::from_rgb(20, 30, 48));
                 ui.painter().text(
                     rect.center(),
                     egui::Align2::CENTER_CENTER,
@@ -696,10 +1117,7 @@ impl eframe::App for ReStemApp {
                     }
                 }
 
-                if ui
-                    .button(lang.tr("🔄 Обновить", "🔄 Refresh"))
-                    .clicked()
-                {
+                if ui.button(lang.tr("🔄 Обновить", "🔄 Refresh")).clicked() {
                     needs_reload = true;
                 }
 
@@ -729,16 +1147,36 @@ impl eframe::App for ReStemApp {
 
                 ui.separator();
 
+                // Поиск с опциями Regex и регистра
                 ui.label("🔍");
-                let search_hint = lang.tr("Поиск по списку...", "Search files...");
+                let search_hint = lang.tr("Поиск по имени...", "Filter by name...");
                 if ui
                     .add(
                         egui::TextEdit::singleline(&mut self.search_query)
                             .hint_text(search_hint)
-                            .desired_width(170.0),
+                            .desired_width(160.0),
                     )
                     .changed()
                 {
+                    needs_recalc = true;
+                }
+                if ui
+                    .selectable_label(self.search_case_sensitive, "Aa")
+                    .on_hover_text(lang.tr("Учитывать регистр в поиске", "Case-sensitive search"))
+                    .clicked()
+                {
+                    self.search_case_sensitive = !self.search_case_sensitive;
+                    needs_recalc = true;
+                }
+                if ui
+                    .selectable_label(self.search_regex, ".*")
+                    .on_hover_text(lang.tr(
+                        "Использовать Regex в поиске",
+                        "Use Regex in search filter",
+                    ))
+                    .clicked()
+                {
+                    self.search_regex = !self.search_regex;
                     needs_recalc = true;
                 }
                 if !self.search_query.is_empty() && ui.small_button("✖").clicked() {
@@ -773,7 +1211,10 @@ impl eframe::App for ReStemApp {
                     };
                     if ui
                         .button(theme_label)
-                        .on_hover_text(lang.tr("Сменить тему оформления", "Toggle Light/Dark theme"))
+                        .on_hover_text(lang.tr(
+                            "Сменить тему оформления",
+                            "Toggle Light/Dark theme",
+                        ))
                         .clicked()
                     {
                         self.dark_mode = !self.dark_mode;
@@ -783,24 +1224,158 @@ impl eframe::App for ReStemApp {
                             ctx.set_visuals(egui::Visuals::light());
                         }
                     }
-
-                    ui.separator();
-
-                    if ui
-                        .checkbox(&mut self.recursive, lang.tr("Вложенные", "Recursive"))
-                        .changed()
-                    {
-                        needs_reload = true;
-                    }
-                    needs_recalc |= ui
-                        .checkbox(&mut self.include_dirs, lang.tr("Папки", "Folders"))
-                        .changed();
-                    needs_recalc |= ui
-                        .checkbox(&mut self.include_files, lang.tr("Файлы", "Files"))
-                        .changed();
                 });
             });
-            ui.add_space(4.0);
+
+            ui.separator();
+
+            // Ряд 2: Панель фильтрации объектов и сортировки
+            ui.horizontal(|ui| {
+                ui.strong(lang.tr("Объекты:", "Items:"));
+                needs_recalc |= ui
+                    .checkbox(&mut self.include_files, lang.tr("Файлы", "Files"))
+                    .changed();
+                needs_recalc |= ui
+                    .checkbox(&mut self.include_dirs, lang.tr("Папки", "Folders"))
+                    .changed();
+                if ui
+                    .checkbox(&mut self.recursive, lang.tr("Вложенные", "Recursive"))
+                    .changed()
+                {
+                    needs_reload = true;
+                }
+                if ui
+                    .checkbox(
+                        &mut self.hide_system_hidden,
+                        lang.tr("Скрыть системные/.git", "Hide system/.git"),
+                    )
+                    .changed()
+                {
+                    needs_reload = true;
+                }
+
+                ui.separator();
+
+                // Фильтр по статусу
+                ui.label(lang.tr("Показать:", "Show:"));
+                egui::ComboBox::from_id_salt("status_filter_cb")
+                    .width(150.0)
+                    .selected_text(match self.status_filter {
+                        StatusFilter::All => lang.tr("Все объекты", "All items"),
+                        StatusFilter::OnlyChanged => lang.tr("Только изменяемые", "Only changing"),
+                        StatusFilter::OnlyIncluded => lang.tr("Только выбранные ☑", "Only checked ☑"),
+                        StatusFilter::OnlyUnchanged => lang.tr("Без изменений", "Unchanged only"),
+                    })
+                    .show_ui(ui, |ui| {
+                        needs_recalc |= ui
+                            .selectable_value(
+                                &mut self.status_filter,
+                                StatusFilter::All,
+                                lang.tr("Все объекты", "All items"),
+                            )
+                            .changed();
+                        needs_recalc |= ui
+                            .selectable_value(
+                                &mut self.status_filter,
+                                StatusFilter::OnlyChanged,
+                                lang.tr("Только изменяемые", "Only changing"),
+                            )
+                            .changed();
+                        needs_recalc |= ui
+                            .selectable_value(
+                                &mut self.status_filter,
+                                StatusFilter::OnlyIncluded,
+                                lang.tr("Только выбранные ☑", "Only checked ☑"),
+                            )
+                            .changed();
+                        needs_recalc |= ui
+                            .selectable_value(
+                                &mut self.status_filter,
+                                StatusFilter::OnlyUnchanged,
+                                lang.tr("Без изменений", "Unchanged only"),
+                            )
+                            .changed();
+                    });
+
+                ui.separator();
+
+                // Выбор поля и направления сортировки
+                ui.strong(lang.tr("Сортировка:", "Sort by:"));
+                egui::ComboBox::from_id_salt("sort_field_cb")
+                    .width(175.0)
+                    .selected_text(match self.sort_field {
+                        SortField::NaturalName => {
+                            lang.tr("Умная по имени (1, 2, 10)", "Natural Name (1, 2, 10)")
+                        }
+                        SortField::AlphaName => lang.tr("По алфавиту (А–Я)", "Alphabetical (A–Z)"),
+                        SortField::ModifiedDate => lang.tr("По дате изменения", "Modified Date"),
+                        SortField::Size => lang.tr("По размеру файла", "File Size"),
+                        SortField::Extension => lang.tr("По расширению", "Extension / Type"),
+                        SortField::FolderPath => lang.tr("По расположению", "Folder Path"),
+                    })
+                    .show_ui(ui, |ui| {
+                        needs_recalc |= ui
+                            .selectable_value(
+                                &mut self.sort_field,
+                                SortField::NaturalName,
+                                lang.tr("Умная по имени (1, 2, 10)", "Natural Name (1, 2, 10)"),
+                            )
+                            .changed();
+                        needs_recalc |= ui
+                            .selectable_value(
+                                &mut self.sort_field,
+                                SortField::AlphaName,
+                                lang.tr("По алфавиту (А–Я)", "Alphabetical (A–Z)"),
+                            )
+                            .changed();
+                        needs_recalc |= ui
+                            .selectable_value(
+                                &mut self.sort_field,
+                                SortField::ModifiedDate,
+                                lang.tr("По дате изменения", "Modified Date"),
+                            )
+                            .changed();
+                        needs_recalc |= ui
+                            .selectable_value(
+                                &mut self.sort_field,
+                                SortField::Size,
+                                lang.tr("По размеру файла", "File Size"),
+                            )
+                            .changed();
+                        needs_recalc |= ui
+                            .selectable_value(
+                                &mut self.sort_field,
+                                SortField::Extension,
+                                lang.tr("По расширению", "Extension / Type"),
+                            )
+                            .changed();
+                        needs_recalc |= ui
+                            .selectable_value(
+                                &mut self.sort_field,
+                                SortField::FolderPath,
+                                lang.tr("По расположению", "Folder Path"),
+                            )
+                            .changed();
+                    });
+
+                let dir_btn_label = if self.sort_asc {
+                    lang.tr("⬆ По возр.", "⬆ Asc")
+                } else {
+                    lang.tr("⬇ По убыв.", "⬇ Desc")
+                };
+                if ui.button(dir_btn_label).clicked() {
+                    self.sort_asc = !self.sort_asc;
+                    needs_recalc = true;
+                }
+
+                needs_recalc |= ui
+                    .checkbox(
+                        &mut self.folders_first,
+                        lang.tr("Папки сверху", "Folders first"),
+                    )
+                    .changed();
+            });
+            ui.add_space(2.0);
         });
 
         // --- НИЖНЯЯ СТРОКА СОСТОЯНИЯ ---
@@ -812,7 +1387,9 @@ impl eframe::App for ReStemApp {
                         .current_dir
                         .as_ref()
                         .map(|p| p.display().to_string())
-                        .unwrap_or_else(|| lang.tr("Папка не выбрана", "No folder selected").to_string());
+                        .unwrap_or_else(|| {
+                            lang.tr("Папка не выбрана", "No folder selected").to_string()
+                        });
                     ui.weak(path_str);
                 });
             });
@@ -821,8 +1398,8 @@ impl eframe::App for ReStemApp {
         // --- ЛЕВАЯ КОЛОНКА: ДЕРЕВО ПАПОК И ШАБЛОНЫ ---
         egui::SidePanel::left("left_explorer_panel")
             .resizable(true)
-            .default_width(220.0)
-            .width_range(170.0..=340.0)
+            .default_width(225.0)
+            .width_range(175.0..=340.0)
             .show(ctx, |ui| {
                 ui.add_space(4.0);
                 ui.heading(lang.tr("Папки", "Folders"));
@@ -851,7 +1428,7 @@ impl eframe::App for ReStemApp {
 
                 egui::ScrollArea::vertical()
                     .id_salt("folders_scroll")
-                    .max_height(260.0)
+                    .max_height(250.0)
                     .show(ui, |ui| {
                         for sub in &self.subfolders {
                             let name = sub
@@ -872,7 +1449,23 @@ impl eframe::App for ReStemApp {
                 ui.add_space(4.0);
 
                 if ui
-                    .button(lang.tr("🔹 Пробелы → подчёркивания (_)", "🔹 Spaces to underscores (_)"))
+                    .button(lang.tr(
+                        "🔹 Транслитерация + без пробелов",
+                        "🔹 Transliterate RU → LAT + _",
+                    ))
+                    .clicked()
+                {
+                    self.transliterate = true;
+                    self.find_str = " ".to_string();
+                    self.replace_str = "_".to_string();
+                    self.use_regex = false;
+                    needs_recalc = true;
+                }
+                if ui
+                    .button(lang.tr(
+                        "🔹 Пробелы → подчёркивания (_)",
+                        "🔹 Spaces to underscores (_)",
+                    ))
                     .clicked()
                 {
                     self.find_str = " ".to_string();
@@ -881,7 +1474,10 @@ impl eframe::App for ReStemApp {
                     needs_recalc = true;
                 }
                 if ui
-                    .button(lang.tr("🔹 Подчёркивания (_) → пробелы", "🔹 Underscores (_) to spaces"))
+                    .button(lang.tr(
+                        "🔹 Подчёркивания (_) → пробелы",
+                        "🔹 Underscores (_) to spaces",
+                    ))
                     .clicked()
                 {
                     self.find_str = "_".to_string();
@@ -890,29 +1486,36 @@ impl eframe::App for ReStemApp {
                     needs_recalc = true;
                 }
                 if ui
-                    .button(lang.tr("🔹 Нумерация фото (IMG_001)", "🔹 Photo sequence (IMG_001)"))
+                    .button(lang.tr(
+                        "🔹 Нумерация по дате съёмки/изм.",
+                        "🔹 Sequence sorted by date",
+                    ))
                     .clicked()
                 {
-                    self.prefix = "IMG_".to_string();
-                    self.num_mode = NumMode::Suffix;
+                    self.sort_field = SortField::ModifiedDate;
+                    self.sort_asc = true;
+                    self.num_mode = NumMode::Prefix;
                     self.num_start = 1;
                     self.num_pad = 3;
                     self.num_sep = "_".to_string();
                     needs_recalc = true;
                 }
                 if ui
-                    .button(lang.tr("🔹 Строчные имена + счётчик", "🔹 Lowercase + counter"))
+                    .button(lang.tr(
+                        "🔹 Строчные имена и расширения",
+                        "🔹 Lowercase name & extension",
+                    ))
                     .clicked()
                 {
                     self.case_mode = CaseMode::Lower;
-                    self.num_mode = NumMode::Suffix;
-                    self.num_start = 1;
-                    self.num_pad = 2;
-                    self.num_sep = "_".to_string();
+                    self.ext_mode = ExtMode::Lower;
                     needs_recalc = true;
                 }
                 if ui
-                    .button(lang.tr("🔹 Убрать копии « (1)», « (2)»", "🔹 Remove ' (1)', ' (2)' copies"))
+                    .button(lang.tr(
+                        "🔹 Убрать копии « (1)», « (2)»",
+                        "🔹 Remove ' (1)', ' (2)' copies",
+                    ))
                     .clicked()
                 {
                     self.find_str = r"\s*\(\d+\)".to_string();
@@ -923,18 +1526,18 @@ impl eframe::App for ReStemApp {
 
                 ui.add_space(8.0);
                 if ui
-                    .button(lang.tr("✖ Сбросить все правила", "✖ Reset All Rules"))
+                    .button(lang.tr("✖ Сбросить все правила и фильтры", "✖ Reset All Rules & Filters"))
                     .clicked()
                 {
                     trigger_reset = true;
                 }
             });
 
-        // --- ПРАВАЯ КОЛОНКА: ИНСПЕКТОР ПРАВИЛ ---
+        // --- ПРАВАЯ КОЛОНКА: ИНСПЕКТОР ПРАВИЛ И ФИЛЬТРОВ ---
         egui::SidePanel::right("right_rules_panel")
             .resizable(true)
-            .default_width(290.0)
-            .width_range(250.0..=400.0)
+            .default_width(310.0)
+            .width_range(270.0..=430.0)
             .show(ctx, |ui| {
                 ui.add_space(4.0);
                 ui.heading(lang.tr("Правила переименования", "Rename Rules"));
@@ -943,6 +1546,7 @@ impl eframe::App for ReStemApp {
                 egui::ScrollArea::vertical()
                     .id_salt("rules_scroll")
                     .show(ui, |ui| {
+                        // 1. Поиск и замена
                         ui.group(|ui| {
                             ui.strong(lang.tr("1. Поиск и замена", "1. Find & Replace"));
                             ui.add_space(2.0);
@@ -951,50 +1555,104 @@ impl eframe::App for ReStemApp {
                             ui.label(lang.tr("Заменить на:", "Replace with:"));
                             needs_recalc |= ui.text_edit_singleline(&mut self.replace_str).changed();
                             needs_recalc |= ui
-                                .checkbox(&mut self.use_regex, lang.tr("Регулярные выражения (Regex)", "Use Regular Expressions"))
+                                .checkbox(
+                                    &mut self.use_regex,
+                                    lang.tr("Регулярные выражения (Regex)", "Use Regular Expressions"),
+                                )
                                 .changed();
                             needs_recalc |= ui
-                                .checkbox(&mut self.case_sensitive, lang.tr("Учитывать регистр", "Case Sensitive"))
+                                .checkbox(
+                                    &mut self.case_sensitive,
+                                    lang.tr("Учитывать регистр", "Case Sensitive"),
+                                )
                                 .changed();
                         });
 
                         ui.add_space(6.0);
 
+                        // 2. Регистр и транслитерация
                         ui.group(|ui| {
-                            ui.strong(lang.tr("2. Регистр букв", "2. Case Transformation"));
+                            ui.strong(lang.tr(
+                                "2. Регистр и транслитерация",
+                                "2. Case & Transliteration",
+                            ));
                             ui.add_space(2.0);
                             egui::ComboBox::from_id_salt("case_cb")
-                                .width(230.0)
+                                .width(250.0)
                                 .selected_text(match self.case_mode {
-                                    CaseMode::None => lang.tr("Не менять", "Default (No change)"),
+                                    CaseMode::None => {
+                                        lang.tr("Не менять регистр", "Default (No change)")
+                                    }
                                     CaseMode::Lower => lang.tr("все строчные", "lowercase"),
                                     CaseMode::Upper => lang.tr("ВСЕ ПРОПИСНЫЕ", "UPPERCASE"),
-                                    CaseMode::Capitalize => lang.tr("Первая буква заглавная", "Capitalize first letter"),
-                                    CaseMode::Title => lang.tr("Каждое Слово С Заглавной", "Title Case Words"),
+                                    CaseMode::Capitalize => {
+                                        lang.tr("Первая буква заглавная", "Capitalize first letter")
+                                    }
+                                    CaseMode::Title => {
+                                        lang.tr("Каждое Слово С Заглавной", "Title Case Words")
+                                    }
                                 })
                                 .show_ui(ui, |ui| {
                                     needs_recalc |= ui
-                                        .selectable_value(&mut self.case_mode, CaseMode::None, lang.tr("Не менять", "Default (No change)"))
+                                        .selectable_value(
+                                            &mut self.case_mode,
+                                            CaseMode::None,
+                                            lang.tr("Не менять регистр", "Default (No change)"),
+                                        )
                                         .changed();
                                     needs_recalc |= ui
-                                        .selectable_value(&mut self.case_mode, CaseMode::Lower, lang.tr("все строчные", "lowercase"))
+                                        .selectable_value(
+                                            &mut self.case_mode,
+                                            CaseMode::Lower,
+                                            lang.tr("все строчные", "lowercase"),
+                                        )
                                         .changed();
                                     needs_recalc |= ui
-                                        .selectable_value(&mut self.case_mode, CaseMode::Upper, lang.tr("ВСЕ ПРОПИСНЫЕ", "UPPERCASE"))
+                                        .selectable_value(
+                                            &mut self.case_mode,
+                                            CaseMode::Upper,
+                                            lang.tr("ВСЕ ПРОПИСНЫЕ", "UPPERCASE"),
+                                        )
                                         .changed();
                                     needs_recalc |= ui
-                                        .selectable_value(&mut self.case_mode, CaseMode::Capitalize, lang.tr("Первая буква заглавная", "Capitalize first letter"))
+                                        .selectable_value(
+                                            &mut self.case_mode,
+                                            CaseMode::Capitalize,
+                                            lang.tr(
+                                                "Первая буква заглавная",
+                                                "Capitalize first letter",
+                                            ),
+                                        )
                                         .changed();
                                     needs_recalc |= ui
-                                        .selectable_value(&mut self.case_mode, CaseMode::Title, lang.tr("Каждое Слово С Заглавной", "Title Case Words"))
+                                        .selectable_value(
+                                            &mut self.case_mode,
+                                            CaseMode::Title,
+                                            lang.tr("Каждое Слово С Заглавной", "Title Case Words"),
+                                        )
                                         .changed();
                                 });
+
+                            ui.add_space(2.0);
+                            needs_recalc |= ui
+                                .checkbox(
+                                    &mut self.transliterate,
+                                    lang.tr(
+                                        "Транслитерация кириллицы (RU → LAT)",
+                                        "Transliterate Cyrillic (RU → LAT)",
+                                    ),
+                                )
+                                .changed();
                         });
 
                         ui.add_space(6.0);
 
+                        // 3. Префикс, суффикс и обрезка
                         ui.group(|ui| {
-                            ui.strong(lang.tr("3. Префикс, суффикс и обрезка", "3. Add Prefix/Suffix & Trim"));
+                            ui.strong(lang.tr(
+                                "3. Префикс, суффикс и обрезка",
+                                "3. Add Prefix/Suffix & Trim",
+                            ));
                             ui.add_space(2.0);
                             egui::Grid::new("prefix_grid").num_columns(2).show(ui, |ui| {
                                 ui.label(lang.tr("Префикс:", "Prefix:"));
@@ -1021,25 +1679,52 @@ impl eframe::App for ReStemApp {
 
                         ui.add_space(6.0);
 
+                        // 4. Нумерация
                         ui.group(|ui| {
-                            ui.strong(lang.tr("4. Нумерация (Сериализация)", "4. Serialization (Numbering)"));
+                            ui.strong(lang.tr(
+                                "4. Нумерация (по порядку сортировки)",
+                                "4. Numbering (follows sort order)",
+                            ));
                             ui.add_space(2.0);
                             egui::ComboBox::from_id_salt("num_cb")
-                                .width(230.0)
+                                .width(250.0)
                                 .selected_text(match self.num_mode {
                                     NumMode::None => lang.tr("Выключена", "Disabled"),
-                                    NumMode::Suffix => lang.tr("В конец имени (Суффикс)", "Append to end (Suffix)"),
-                                    NumMode::Prefix => lang.tr("В начало имени (Префикс)", "Prepend to start (Prefix)"),
+                                    NumMode::Suffix => {
+                                        lang.tr("В конец имени (Суффикс)", "Append to end (Suffix)")
+                                    }
+                                    NumMode::Prefix => lang.tr(
+                                        "В начало имени (Префикс)",
+                                        "Prepend to start (Prefix)",
+                                    ),
                                 })
                                 .show_ui(ui, |ui| {
                                     needs_recalc |= ui
-                                        .selectable_value(&mut self.num_mode, NumMode::None, lang.tr("Выключена", "Disabled"))
+                                        .selectable_value(
+                                            &mut self.num_mode,
+                                            NumMode::None,
+                                            lang.tr("Выключена", "Disabled"),
+                                        )
                                         .changed();
                                     needs_recalc |= ui
-                                        .selectable_value(&mut self.num_mode, NumMode::Suffix, lang.tr("В конец имени (Суффикс)", "Append to end (Suffix)"))
+                                        .selectable_value(
+                                            &mut self.num_mode,
+                                            NumMode::Suffix,
+                                            lang.tr(
+                                                "В конец имени (Суффикс)",
+                                                "Append to end (Suffix)",
+                                            ),
+                                        )
                                         .changed();
                                     needs_recalc |= ui
-                                        .selectable_value(&mut self.num_mode, NumMode::Prefix, lang.tr("В начало имени (Префикс)", "Prepend to start (Prefix)"))
+                                        .selectable_value(
+                                            &mut self.num_mode,
+                                            NumMode::Prefix,
+                                            lang.tr(
+                                                "В начало имени (Префикс)",
+                                                "Prepend to start (Prefix)",
+                                            ),
+                                        )
                                         .changed();
                                 });
 
@@ -1061,24 +1746,187 @@ impl eframe::App for ReStemApp {
                                     .changed();
                                 ui.label(lang.tr("Раздел.:", "Sep:"));
                                 needs_recalc |= ui
-                                    .add(egui::TextEdit::singleline(&mut self.num_sep).desired_width(36.0))
+                                    .add(
+                                        egui::TextEdit::singleline(&mut self.num_sep)
+                                            .desired_width(36.0),
+                                    )
                                     .changed();
                             });
 
                             needs_recalc |= ui
                                 .checkbox(
                                     &mut self.reset_num_per_dir,
-                                    lang.tr("Сброс счётчика в подпапках", "Reset counter per folder"),
+                                    lang.tr(
+                                        "Сброс счётчика в подпапках",
+                                        "Reset counter per folder",
+                                    ),
                                 )
                                 .changed();
                         });
 
                         ui.add_space(6.0);
 
+                        // 5. Управление расширениями
                         ui.group(|ui| {
-                            ui.strong(lang.tr("5. Фильтр расширений", "5. Extension Filter"));
-                            ui.label(lang.tr("Только расширения (jpg, png):", "Only extensions (jpg, png):"));
+                            ui.strong(lang.tr("5. Расширения файлов", "5. File Extensions"));
+                            ui.add_space(2.0);
+
+                            ui.label(lang.tr("Режим расширения:", "Extension mode:"));
+                            egui::ComboBox::from_id_salt("ext_mode_cb")
+                                .width(250.0)
+                                .selected_text(match self.ext_mode {
+                                    ExtMode::Keep => lang.tr("Не менять", "Keep original"),
+                                    ExtMode::Lower => {
+                                        lang.tr("в строчные (.jpg)", "lowercase (.jpg)")
+                                    }
+                                    ExtMode::Upper => {
+                                        lang.tr("В ПРОПИСНЫЕ (.JPG)", "UPPERCASE (.JPG)")
+                                    }
+                                    ExtMode::Remove => {
+                                        lang.tr("Удалить расширение", "Remove extension")
+                                    }
+                                })
+                                .show_ui(ui, |ui| {
+                                    needs_recalc |= ui
+                                        .selectable_value(
+                                            &mut self.ext_mode,
+                                            ExtMode::Keep,
+                                            lang.tr("Не менять", "Keep original"),
+                                        )
+                                        .changed();
+                                    needs_recalc |= ui
+                                        .selectable_value(
+                                            &mut self.ext_mode,
+                                            ExtMode::Lower,
+                                            lang.tr("в строчные (.jpg)", "lowercase (.jpg)"),
+                                        )
+                                        .changed();
+                                    needs_recalc |= ui
+                                        .selectable_value(
+                                            &mut self.ext_mode,
+                                            ExtMode::Upper,
+                                            lang.tr("В ПРОПИСНЫЕ (.JPG)", "UPPERCASE (.JPG)"),
+                                        )
+                                        .changed();
+                                    needs_recalc |= ui
+                                        .selectable_value(
+                                            &mut self.ext_mode,
+                                            ExtMode::Remove,
+                                            lang.tr("Удалить расширение", "Remove extension"),
+                                        )
+                                        .changed();
+                                });
+
+                            ui.label(lang.tr(
+                                "Заменить расширение на (напр. jpg):",
+                                "Replace extension with (e.g. jpg):",
+                            ));
+                            needs_recalc |= ui.text_edit_singleline(&mut self.new_ext).changed();
+                        });
+
+                        ui.add_space(6.0);
+
+                        // 6. Расширенная фильтрация
+                        ui.group(|ui| {
+                            ui.strong(lang.tr(
+                                "6. Фильтры и исключения",
+                                "6. Advanced Filters",
+                            ));
+                            ui.add_space(2.0);
+
+                            ui.label(lang.tr(
+                                "Только расширения (jpg, png):",
+                                "Include extensions (jpg, png):",
+                            ));
                             needs_recalc |= ui.text_edit_singleline(&mut self.ext_filter).changed();
+
+                            ui.label(lang.tr(
+                                "Исключить расширения (tmp, bak):",
+                                "Exclude extensions (tmp, bak):",
+                            ));
+                            needs_recalc |=
+                                ui.text_edit_singleline(&mut self.ext_exclude_filter).changed();
+
+                            ui.label(lang.tr(
+                                "Исключить слова в имени (через запятую):",
+                                "Exclude words in name (comma-sep):",
+                            ));
+                            needs_recalc |= ui
+                                .text_edit_singleline(&mut self.exclude_words_filter)
+                                .changed();
+
+                            ui.label(lang.tr("Фильтр по размеру:", "File size filter:"));
+                            egui::ComboBox::from_id_salt("size_filter_cb")
+                                .width(250.0)
+                                .selected_text(match self.size_filter_mode {
+                                    SizeFilterMode::Any => lang.tr("Любой размер", "Any size"),
+                                    SizeFilterMode::GreaterThanKB => {
+                                        lang.tr("Больше чем (КБ)", "Greater than (KB)")
+                                    }
+                                    SizeFilterMode::LessThanKB => {
+                                        lang.tr("Меньше чем (КБ)", "Less than (KB)")
+                                    }
+                                    SizeFilterMode::BetweenKB => {
+                                        lang.tr("Диапазон (от / до КБ)", "Between (min / max KB)")
+                                    }
+                                })
+                                .show_ui(ui, |ui| {
+                                    needs_recalc |= ui
+                                        .selectable_value(
+                                            &mut self.size_filter_mode,
+                                            SizeFilterMode::Any,
+                                            lang.tr("Любой размер", "Any size"),
+                                        )
+                                        .changed();
+                                    needs_recalc |= ui
+                                        .selectable_value(
+                                            &mut self.size_filter_mode,
+                                            SizeFilterMode::GreaterThanKB,
+                                            lang.tr("Больше чем (КБ)", "Greater than (KB)"),
+                                        )
+                                        .changed();
+                                    needs_recalc |= ui
+                                        .selectable_value(
+                                            &mut self.size_filter_mode,
+                                            SizeFilterMode::LessThanKB,
+                                            lang.tr("Меньше чем (КБ)", "Less than (KB)"),
+                                        )
+                                        .changed();
+                                    needs_recalc |= ui
+                                        .selectable_value(
+                                            &mut self.size_filter_mode,
+                                            SizeFilterMode::BetweenKB,
+                                            lang.tr("Диапазон (от / до КБ)", "Between (min / max KB)"),
+                                        )
+                                        .changed();
+                                });
+
+                            if self.size_filter_mode != SizeFilterMode::Any {
+                                ui.horizontal(|ui| {
+                                    if self.size_filter_mode == SizeFilterMode::GreaterThanKB
+                                        || self.size_filter_mode == SizeFilterMode::BetweenKB
+                                    {
+                                        ui.label(lang.tr("От (КБ):", "Min (KB):"));
+                                        needs_recalc |= ui
+                                            .add(
+                                                egui::DragValue::new(&mut self.size_min_kb)
+                                                    .range(0..=10_000_000),
+                                            )
+                                            .changed();
+                                    }
+                                    if self.size_filter_mode == SizeFilterMode::LessThanKB
+                                        || self.size_filter_mode == SizeFilterMode::BetweenKB
+                                    {
+                                        ui.label(lang.tr("До (КБ):", "Max (KB):"));
+                                        needs_recalc |= ui
+                                            .add(
+                                                egui::DragValue::new(&mut self.size_max_kb)
+                                                    .range(1..=10_000_000),
+                                            )
+                                            .changed();
+                                    }
+                                });
+                            }
                         });
 
                         ui.add_space(12.0);
@@ -1122,19 +1970,45 @@ impl eframe::App for ReStemApp {
                 self.undo_rename();
             }
 
-            ui.heading(lang.tr("Файлы и папки для переименования", "Files to Rename"));
+            ui.horizontal(|ui| {
+                ui.heading(lang.tr("Файлы и папки для переименования", "Files to Rename"));
+                ui.weak(lang.tr(
+                    "(кликните по заголовку столбца для быстрой сортировки)",
+                    "(click column headers to sort)",
+                ));
+            });
             ui.add_space(4.0);
 
             let mut toggle_all: Option<bool> = None;
             let mut toggled_item: Option<(PathBuf, bool)> = None;
-            let all_included = !self.preview_rows.is_empty()
-                && self.preview_rows.iter().all(|r| r.included);
+            let all_included =
+                !self.preview_rows.is_empty() && self.preview_rows.iter().all(|r| r.included);
 
-            let col_type_title = lang.tr("Тип", "Type");
-            let col_orig_title = lang.tr("Текущее имя", "Original Name");
+            let arrow = if self.sort_asc { "▲" } else { "▼" };
+            let col_type_title = if self.sort_field == SortField::Extension {
+                format!("{} {}", lang.tr("Тип", "Type"), arrow)
+            } else {
+                lang.tr("Тип ↕", "Type ↕").to_string()
+            };
+            let col_orig_title = if self.sort_field == SortField::NaturalName
+                || self.sort_field == SortField::AlphaName
+            {
+                format!("{} {}", lang.tr("Текущее имя", "Original Name"), arrow)
+            } else {
+                lang.tr("Текущее имя ↕", "Original Name ↕").to_string()
+            };
             let col_new_title = lang.tr("Новое имя", "New Name");
             let col_status_title = lang.tr("Статус", "Status");
-            let col_size_title = lang.tr("Размер", "Size");
+            let col_size_title = if self.sort_field == SortField::Size {
+                format!("{} {}", lang.tr("Размер", "Size"), arrow)
+            } else {
+                lang.tr("Размер ↕", "Size ↕").to_string()
+            };
+            let col_date_title = if self.sort_field == SortField::ModifiedDate {
+                format!("{} {}", lang.tr("Изменён", "Modified"), arrow)
+            } else {
+                lang.tr("Изменён ↕", "Modified ↕").to_string()
+            };
 
             let status_ready = lang.tr("Готов", "Ready");
             let status_changed = lang.tr("Изменится", "Preview");
@@ -1149,10 +2023,11 @@ impl eframe::App for ReStemApp {
                 .resizable(true)
                 .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
                 .column(Column::exact(32.0))
-                .column(Column::initial(95.0).resizable(true))
-                .column(Column::initial(240.0).resizable(true))
-                .column(Column::initial(240.0).resizable(true))
-                .column(Column::initial(90.0).resizable(true))
+                .column(Column::initial(85.0).resizable(true))
+                .column(Column::initial(220.0).resizable(true))
+                .column(Column::initial(220.0).resizable(true))
+                .column(Column::initial(80.0).resizable(true))
+                .column(Column::initial(80.0).resizable(true))
                 .column(Column::remainder())
                 .header(24.0, |mut header| {
                     header.col(|ui| {
@@ -1162,10 +2037,14 @@ impl eframe::App for ReStemApp {
                         }
                     });
                     header.col(|ui| {
-                        ui.strong(col_type_title);
+                        if ui.button(col_type_title).clicked() {
+                            clicked_sort_col = Some(SortField::Extension);
+                        }
                     });
                     header.col(|ui| {
-                        ui.strong(col_orig_title);
+                        if ui.button(col_orig_title).clicked() {
+                            clicked_sort_col = Some(SortField::NaturalName);
+                        }
                     });
                     header.col(|ui| {
                         ui.strong(col_new_title);
@@ -1174,7 +2053,14 @@ impl eframe::App for ReStemApp {
                         ui.strong(col_status_title);
                     });
                     header.col(|ui| {
-                        ui.strong(col_size_title);
+                        if ui.button(col_size_title).clicked() {
+                            clicked_sort_col = Some(SortField::Size);
+                        }
+                    });
+                    header.col(|ui| {
+                        if ui.button(col_date_title).clicked() {
+                            clicked_sort_col = Some(SortField::ModifiedDate);
+                        }
                     });
                 })
                 .body(|body| {
@@ -1190,7 +2076,11 @@ impl eframe::App for ReStemApp {
                         });
 
                         row.col(|ui| {
-                            let kind_str = if item.is_dir { label_folder } else { label_file };
+                            let kind_str = if item.is_dir {
+                                label_folder
+                            } else {
+                                label_file
+                            };
                             if !item.included {
                                 ui.colored_label(muted, kind_str);
                             } else if item.is_dir {
@@ -1257,10 +2147,17 @@ impl eframe::App for ReStemApp {
                             let size_str = Self::format_size(item.size, item.is_dir);
                             ui.weak(size_str);
                         });
+
+                        row.col(|ui| {
+                            let date_str = format_timestamp(item.modified_ts);
+                            ui.weak(date_str);
+                        });
                     });
                 });
 
-            if let Some(select_all) = toggle_all {
+            if let Some(col_field) = clicked_sort_col {
+                self.toggle_column_sort(col_field);
+            } else if let Some(select_all) = toggle_all {
                 if select_all {
                     for row in &self.preview_rows {
                         self.excluded_paths.remove(&row.old_path);
