@@ -73,38 +73,6 @@
 3. Нажмите **«📁 Открыть папку...»** или перетащите нужный каталог мышью в окно программы.
 
 ---
-
-### ⚙️ Сборка из исходного кода
-
-#### Вариант А. В облаке через GitHub Actions (без установки Rust на ПК)
-В репозитории уже настроен рабочий процесс `.github/workflows/build.yml`. При каждом изменении кода облачный сервер GitHub автоматически компилирует оптимизированный `restem.exe`, генерирует и вшивает в него иконку `.ico` через `build.rs` и публикует готовый файл в раздел **Releases** и **Artifacts**.
-
-#### Вариант Б. Локальная сборка
-Если у вас установлен инструментарий [Rust](https://rustup.rs/):
-
-```bash
-git clone [https://github.com/ВАШ_ЛОГИН/ВАШ_РЕПОЗИТОРИЙ.git](https://github.com/ВАШ_ЛОГИН/ВАШ_РЕПОЗИТОРИЙ.git)
-cd ВАШ_РЕПОЗИТОРИЙ
-cargo build --release
-```
-Готовый файл появится по пути `target/release/restem.exe`. Для замены стандартной иконки на собственную достаточно положить файл `icon.ico` в корень проекта перед сборкой.
-
----
-
-### 📂 Структура проекта
-
-```text
-├── .github/
-│   └── workflows/
-│       └── build.yml    # CI/CD сценарий автоматической сборки Windows EXE
-├── src/
-│   └── main.rs          # Исходный код интерфейса и логики ReStem
-├── build.rs             # Программная генерация логотипа .ico и вшивание метаданных в .exe
-├── Cargo.toml           # Конфигурация пакета, зависимостей и агрессивного сжатия размера
-└── README.md            # Документация проекта (RU / EN)
-```
-
----
 ---
 
 ## 🇬🇧 ReStem — Fast Bulk File & Folder Renamer
@@ -156,4 +124,8 @@ cargo build --release
 
 ### 🚀 Download & Usage
 
-1. Go to the [**Releases**](../../releases) section (or download the `ReStem-
+1. Go to the [**Releases**](../../releases) section (or download the `ReStem-Portable` artifact from the **Actions** tab).
+2. Run `restem.exe` — no installation or runtime required.
+3. Click **📁 Add Folder...** or drag and drop a folder into the application window.
+
+---
