@@ -1,5 +1,7 @@
 <div align="center">
 
+
+
 # ReStem
 
 **Быстрое пакетное переименование файлов и каталогов на Rust**  
@@ -12,7 +14,13 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-success)](LICENSE)
 
 [**🇷🇺 Русская документация**](#-restem--пакетное-переименование-файлов-и-папок) &nbsp;|&nbsp; [**🇬🇧 English Documentation**](#-restem--fast-bulk-file--folder-renamer) &nbsp;|&nbsp; [**📋 История изменений (Changelog)**](CHANGELOG.md)
+<br>
 
+[![Скачать ReStem v1.2.0](https://img.shields.io/badge/⬇_Скачать_ReStem_v1.2.0-Прямая_ссылка_(.exe)-0078d4?style=for-the-badge&logo=windows&logoColor=white)](../../releases/latest/download/restem_1.2.0.exe)
+
+<br>
+
+[**🇷🇺 Русская документация**](#-restem--пакетное-переименование-файлов-и-папок) &nbsp;|&nbsp; [**🇬🇧 English Documentation**](#-restem--fast-bulk-file--folder-renamer) &nbsp;|&nbsp; [**📋 История изменений (Changelog)**](CHANGELOG.md)
 </div>
 
 ---
