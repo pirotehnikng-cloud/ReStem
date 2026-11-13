@@ -32,10 +32,16 @@ jobs:
           name: ReStem-Portable
           path: target/release/restem.exe
 
-      - name: Publish EXE to GitHub Releases
+      - name: Publish EXE and Changelog to GitHub Releases
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          gh release upload v1.0.0 target/release/restem.exe --clobber || \
-          gh release create v1.0.0 target/release/restem.exe --title "ReStem v1.0.0" --notes "Автономная сборка ReStem для Windows (x64)"
+          VERSION=$(grep -m1 '^version' Cargo.toml | cut -d '"' -f 2)
+          TAG="v${VERSION}"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" target/release/restem.exe --clobber
+            gh release edit "$TAG" --title "ReStem $TAG" --notes-file CHANGELOG.md
+          else
+            gh release create "$TAG" target/release/restem.exe --title "ReStem $TAG" --notes-file CHANGELOG.md
+          fi
