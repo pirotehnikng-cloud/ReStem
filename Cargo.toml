@@ -3,6 +3,8 @@ name = "restem"
 version = "1.2.0"
 edition = "2021"
 description = "ReStem — Fast Bulk File & Folder Renamer"
+license = "MIT"
+readme = "README.md"
 
 [dependencies]
 eframe = "0.29"
