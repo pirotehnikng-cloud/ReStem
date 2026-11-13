@@ -26,22 +26,31 @@ jobs:
       - name: Build optimized ReStem EXE
         run: cargo build --release
 
+      - name: Rename EXE with version from Cargo.toml
+        shell: bash
+        run: |
+          VERSION=$(grep -m1 '^version' Cargo.toml | cut -d '"' -f 2)
+          EXE_NAME="restem_${VERSION}.exe"
+          cp target/release/restem.exe "target/release/${EXE_NAME}"
+          echo "VERSION=${VERSION}" >> "$GITHUB_ENV"
+          echo "EXE_NAME=${EXE_NAME}" >> "$GITHUB_ENV"
+
       - name: Upload compiled EXE to Artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: ReStem-Portable
-          path: target/release/restem.exe
+          name: ReStem-${{ env.VERSION }}-Portable
+          path: target/release/${{ env.EXE_NAME }}
 
       - name: Publish EXE and Changelog to GitHub Releases
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          VERSION=$(grep -m1 '^version' Cargo.toml | cut -d '"' -f 2)
           TAG="v${VERSION}"
           if gh release view "$TAG" >/dev/null 2>&1; then
-            gh release upload "$TAG" target/release/restem.exe --clobber
+            gh release upload "$TAG" "target/release/${EXE_NAME}" --clobber
+            gh release delete-asset "$TAG" restem.exe --yes 2>/dev/null || true
             gh release edit "$TAG" --title "ReStem $TAG" --notes-file CHANGELOG.md
           else
-            gh release create "$TAG" target/release/restem.exe --title "ReStem $TAG" --notes-file CHANGELOG.md
+            gh release create "$TAG" "target/release/${EXE_NAME}" --title "ReStem $TAG" --notes-file CHANGELOG.md
           fi
