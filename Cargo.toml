@@ -3,7 +3,7 @@ name = "restem"
 version = "1.3.0"
 edition = "2021"
 description = "ReStem — Fast Bulk File & Folder Renamer"
-license = "MIT"
+license = "GPL-3.0-only"
 readme = "README.md"
 repository = "https://github.com/pirotehnikng-cloud/ReStem"
 
