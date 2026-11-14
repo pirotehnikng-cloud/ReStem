@@ -2224,6 +2224,11 @@ impl eframe::App for ReStemApp {
         let mut settings_dirty = false;
 
         let checked_count = self.preview_rows.iter().filter(|r| r.included).count();
+        let ready_to_rename_count = self
+            .preview_rows
+            .iter()
+            .filter(|r| r.included && r.changed)
+            .count();
 
         // --- МОДАЛЬНОЕ ОКНО: ШПАРГАЛКА REGEX ---
         if self.show_regex_help_modal {
@@ -2617,6 +2622,43 @@ impl eframe::App for ReStemApp {
                     needs_recalc = true;
                 }
 
+                // Дублирующая яркая кнопка «Применить» прямо на верхней панели
+                let top_apply_label = match lang {
+                    Lang::Ru => format!("✔ Применить ({})", ready_to_rename_count),
+                    Lang::En => format!("✔ Apply ({})", ready_to_rename_count),
+                };
+                let top_apply_fill = if ready_to_rename_count > 0 {
+                    egui::Color32::from_rgb(16, 148, 92)
+                } else if is_dark {
+                    egui::Color32::from_rgb(42, 48, 60)
+                } else {
+                    egui::Color32::from_rgb(210, 216, 226)
+                };
+                let top_apply_fg = if ready_to_rename_count > 0 {
+                    egui::Color32::WHITE
+                } else if is_dark {
+                    egui::Color32::from_gray(160)
+                } else {
+                    egui::Color32::from_gray(105)
+                };
+                let top_apply_btn = egui::Button::new(
+                    egui::RichText::new(top_apply_label)
+                        .color(top_apply_fg)
+                        .strong(),
+                )
+                .fill(top_apply_fill);
+
+                if ui
+                    .add_enabled(ready_to_rename_count > 0, top_apply_btn)
+                    .on_hover_text(lang.tr(
+                        "Применить правила переименования (Ctrl+Enter)",
+                        "Apply rename rules (Ctrl+Enter)",
+                    ))
+                    .clicked()
+                {
+                    trigger_apply = true;
+                }
+
                 let undo_label = match lang {
                     Lang::Ru => format!("↺ Откат ({})", self.undo_stack.len()),
                     Lang::En => format!("↺ Undo ({})", self.undo_stack.len()),
@@ -2663,7 +2705,7 @@ impl eframe::App for ReStemApp {
                     .add(
                         egui::TextEdit::singleline(&mut self.search_query)
                             .hint_text(search_hint)
-                            .desired_width(115.0),
+                            .desired_width(105.0),
                     )
                     .changed()
                 {
@@ -3239,27 +3281,142 @@ impl eframe::App for ReStemApp {
                                     settings_dirty = true;
                                 }
                             });
-
-                            ui.add_space(4.0);
-                            if ui
-                                .button(lang.tr(
-                                    "✖ Сбросить все правила и фильтры",
-                                    "✖ Reset All Rules & Filters",
-                                ))
-                                .clicked()
-                            {
-                                trigger_reset = true;
-                            }
                         });
                     });
             });
 
-        // --- ПРАВАЯ КОЛОНКА: КАРТОЧКИ ПРАВИЛ И ФИЛЬТРОВ ---
+        // --- ПРАВАЯ КОЛОНКА: ЗАКРЕПЛЁННЫЙ НИЖНИЙ ДОК + ПРОКРУЧИВАЕМЫЕ ПРАВИЛА ---
         egui::SidePanel::right("right_rules_panel")
             .resizable(true)
-            .default_width(335.0)
-            .width_range(290.0..=450.0)
+            .default_width(340.0)
+            .width_range(295.0..=450.0)
             .show(ctx, |ui| {
+                // 1. Закреплённый нижний блок (Sticky Footer) — ВСЕГДА виден без прокрутки
+                let (dock_bg, dock_border) = if ready_to_rename_count > 0 {
+                    if is_dark {
+                        (
+                            egui::Color32::from_rgb(20, 38, 32),
+                            egui::Color32::from_rgb(35, 185, 120),
+                        )
+                    } else {
+                        (
+                            egui::Color32::from_rgb(232, 248, 240),
+                            egui::Color32::from_rgb(22, 160, 100),
+                        )
+                    }
+                } else if is_dark {
+                    (
+                        egui::Color32::from_rgb(25, 29, 38),
+                        egui::Color32::from_rgb(52, 60, 76),
+                    )
+                } else {
+                    (
+                        egui::Color32::from_rgb(236, 240, 246),
+                        egui::Color32::from_rgb(205, 212, 224),
+                    )
+                };
+
+                let sticky_frame = egui::Frame::none()
+                    .fill(dock_bg)
+                    .stroke(egui::Stroke::new(1.5_f32, dock_border))
+                    .inner_margin(egui::Margin::symmetric(10.0, 8.0));
+
+                egui::TopBottomPanel::bottom("right_sticky_apply_bar")
+                    .frame(sticky_frame)
+                    .show_inside(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            if ready_to_rename_count > 0 {
+                                let badge_col = if is_dark {
+                                    egui::Color32::from_rgb(95, 235, 160)
+                                } else {
+                                    egui::Color32::from_rgb(12, 120, 65)
+                                };
+                                ui.colored_label(
+                                    badge_col,
+                                    match lang {
+                                        Lang::Ru => format!(
+                                            "⚡ Готово к переименованию: {} шт.",
+                                            ready_to_rename_count
+                                        ),
+                                        Lang::En => format!(
+                                            "⚡ Ready to rename: {} items",
+                                            ready_to_rename_count
+                                        ),
+                                    },
+                                );
+                            } else {
+                                ui.weak(lang.tr(
+                                    "Задайте правила выше для предпросмотра",
+                                    "Adjust rules above to preview changes",
+                                ));
+                            }
+
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    if ui
+                                        .small_button(lang.tr("✖ Сброс", "✖ Reset"))
+                                        .on_hover_text(lang.tr(
+                                            "Сбросить все правила и фильтры",
+                                            "Reset all rules and filters",
+                                        ))
+                                        .clicked()
+                                    {
+                                        trigger_reset = true;
+                                    }
+                                },
+                            );
+                        });
+
+                        ui.add_space(4.0);
+
+                        let main_btn_label = if ready_to_rename_count > 0 {
+                            match lang {
+                                Lang::Ru => format!(
+                                    "✔ Применить изменения ({})  [Ctrl+Enter]",
+                                    ready_to_rename_count
+                                ),
+                                Lang::En => format!(
+                                    "✔ Apply Changes ({})  [Ctrl+Enter]",
+                                    ready_to_rename_count
+                                ),
+                            }
+                        } else {
+                            lang.tr(
+                                "✔ Применить изменения (Ctrl+Enter)",
+                                "✔ Apply Changes (Ctrl+Enter)",
+                            )
+                            .to_string()
+                        };
+
+                        let (btn_fill, btn_fg) = if ready_to_rename_count > 0 {
+                            (
+                                egui::Color32::from_rgb(16, 150, 92),
+                                egui::Color32::WHITE,
+                            )
+                        } else {
+                            (
+                                egui::Color32::from_rgb(18, 118, 215),
+                                egui::Color32::WHITE,
+                            )
+                        };
+
+                        let btn_text = egui::RichText::new(main_btn_label)
+                            .color(btn_fg)
+                            .strong()
+                            .size(15.5);
+
+                        let apply_btn = egui::Button::new(btn_text)
+                            .fill(btn_fill)
+                            .rounding(7.0)
+                            .min_size(egui::vec2(ui.available_width(), 44.0));
+
+                        if ui.add(apply_btn).clicked() {
+                            trigger_apply = true;
+                        }
+                    });
+
+                // 2. Заголовок правой панели
                 ui.add_space(4.0);
                 ui.horizontal(|ui| {
                     ui.heading(lang.tr("Правила", "Rename Rules"));
@@ -3276,8 +3433,10 @@ impl eframe::App for ReStemApp {
                 });
                 ui.add_space(4.0);
 
+                // 3. Прокручиваемая область карточек правил (занимает пространство над кнопкой)
                 egui::ScrollArea::vertical()
                     .id_salt("rules_scroll")
+                    .auto_shrink([false, false])
                     .show(ui, |ui| {
                         card_frame(is_dark).show(ui, |ui| {
                             ui.set_min_width(ui.available_width());
@@ -3778,24 +3937,7 @@ impl eframe::App for ReStemApp {
                                 });
                             }
                         });
-
-                        ui.add_space(12.0);
-
-                        let btn_text = egui::RichText::new(
-                            lang.tr("✔ Применить изменения (Ctrl+Enter)", "✔ Apply Changes (Ctrl+Enter)"),
-                        )
-                        .color(egui::Color32::WHITE)
-                        .strong()
-                        .size(15.0);
-
-                        let apply_btn = egui::Button::new(btn_text)
-                            .fill(egui::Color32::from_rgb(18, 118, 215))
-                            .rounding(6.0)
-                            .min_size(egui::vec2(ui.available_width(), 40.0));
-
-                        if ui.add(apply_btn).clicked() {
-                            trigger_apply = true;
-                        }
+                        ui.add_space(6.0);
                     });
             });
 
