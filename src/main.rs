@@ -146,7 +146,7 @@ fn apply_theme_and_style(ctx: &egui::Context, dark_mode: bool) {
         visuals.extreme_bg_color = egui::Color32::from_rgb(14, 16, 22);
         visuals.faint_bg_color = egui::Color32::from_rgb(26, 31, 40);
         visuals.widgets.noninteractive.bg_stroke =
-            egui::Stroke::new(1.0, egui::Color32::from_rgb(48, 55, 70));
+            egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(48, 55, 70));
         visuals.widgets.inactive.bg_fill = egui::Color32::from_rgb(38, 44, 56);
         visuals.widgets.hovered.bg_fill = egui::Color32::from_rgb(50, 60, 78);
         visuals.selection.bg_fill = egui::Color32::from_rgb(25, 110, 195);
@@ -157,7 +157,7 @@ fn apply_theme_and_style(ctx: &egui::Context, dark_mode: bool) {
         visuals.extreme_bg_color = egui::Color32::from_rgb(255, 255, 255);
         visuals.faint_bg_color = egui::Color32::from_rgb(233, 237, 244);
         visuals.widgets.noninteractive.bg_stroke =
-            egui::Stroke::new(1.0, egui::Color32::from_rgb(210, 216, 226));
+            egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(210, 216, 226));
         visuals.widgets.inactive.bg_fill = egui::Color32::from_rgb(228, 233, 241);
         visuals.widgets.hovered.bg_fill = egui::Color32::from_rgb(210, 220, 235);
         visuals.selection.bg_fill = egui::Color32::from_rgb(18, 118, 215);
@@ -183,7 +183,7 @@ fn card_frame(dark_mode: bool) -> egui::Frame {
     egui::Frame::none()
         .fill(fill)
         .rounding(8.0)
-        .stroke(egui::Stroke::new(1.0, stroke_col))
+        .stroke(egui::Stroke::new(1.0_f32, stroke_col))
         .inner_margin(egui::Margin::same(10.0))
 }
 
@@ -701,7 +701,7 @@ fn build_diff_layout_job(
                     font_id: font_id.clone(),
                     color: del_fg,
                     background: del_bg,
-                    strikethrough: egui::Stroke::new(1.0, del_fg),
+                    strikethrough: egui::Stroke::new(1.0_f32, del_fg),
                     ..Default::default()
                 },
             );
@@ -3804,13 +3804,10 @@ impl eframe::App for ReStemApp {
             if settings_dirty {
                 self.save_settings();
             }
-            if let Some(target) = open_sys_target {
-                open_in_system(&target);
-            }
-            if let Some(target) = single_trash_target {
+            if let Some(target) = single_trash_target.take() {
                 self.delete_paths_to_trash(vec![target]);
             }
-            if let Some(folder) = navigate_to {
+            if let Some(folder) = navigate_to.take() {
                 self.open_new_directory(folder);
             } else if needs_reload {
                 if let Some(dir) = self.current_dir.clone() {
@@ -4066,11 +4063,14 @@ impl eframe::App for ReStemApp {
                     });
             });
 
-            if let Some(target_path) = inspect_target {
+            if let Some(target) = open_sys_target.take() {
+                open_in_system(&target);
+            }
+            if let Some(target_path) = inspect_target.take() {
                 self.select_for_preview(target_path, ctx);
-            } else if let Some(col_field) = clicked_sort_col {
+            } else if let Some(col_field) = clicked_sort_col.take() {
                 self.toggle_column_sort(col_field);
-            } else if let Some(select_all) = toggle_all {
+            } else if let Some(select_all) = toggle_all.take() {
                 if select_all {
                     for row in &self.preview_rows {
                         self.excluded_paths.remove(&row.old_path);
@@ -4081,7 +4081,7 @@ impl eframe::App for ReStemApp {
                     }
                 }
                 self.recalculate_preview();
-            } else if let Some((path, include)) = toggled_item {
+            } else if let Some((path, include)) = toggled_item.take() {
                 if include {
                     self.excluded_paths.remove(&path);
                 } else {
