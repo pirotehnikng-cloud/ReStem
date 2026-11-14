@@ -9,7 +9,7 @@
 [![Downloads](https://img.shields.io/github/downloads/pirotehnikng-cloud/ReStem/total?label=Downloads&color=0078d4&logo=windows)](../../releases/latest)
 [![Language: Rust](https://img.shields.io/badge/Rust-2021_Edition-orange?logo=rust)](https://www.rust-lang.org/)
 [![GUI: egui](https://img.shields.io/badge/GUI-eframe_%2F_egui-00b4d8)](https://github.com/emilk/egui)
-[![License: MIT](https://img.shields.io/badge/License-MIT-success)](LICENSE)
+[![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](LICENSE)
 
 <br>
 
@@ -106,7 +106,11 @@
 
 ### 📄 Лицензия
 
-Распространяется под лицензией **MIT License**. Свободно для личного и коммерческого использования.
+Программа **ReStem** является свободным программным обеспечением и распространяется под лицензией **GNU General Public License v3.0 (GPLv3)** (см. файл [LICENSE](LICENSE)).
+
+* **Разрешено:** бесплатное использование в личных и коммерческих целях, свободное распространение копий и модификация исходного кода.
+* **Главное условие (Copyleft):** любые изменённые версии программы или производные продукты, использующие код ReStem, должны распространяться с открытым исходным кодом под той же лицензией **GNU GPL v3**. Запрещается закрывать исходный код в проприетарных сборках.
+* **Отказ от ответственности:** программа предоставляется по принципу «как есть» (*AS IS*), без каких-либо гарантий.
 
 ---
 ---
@@ -189,4 +193,7 @@
 
 ### 📄 License
 
-Distributed under the **MIT License**. Free for personal and commercial use.
+**ReStem** is free and open-source software distributed under the terms of the **GNU General Public License v3.0 (GPLv3)** (see [LICENSE](LICENSE) for full details).
+
+* You are free to use, study, share, and modify the software for personal or commercial purposes.
+* Any derivative works or modified distributions must remain open-source and be licensed under the same **GNU GPL v3** terms.
