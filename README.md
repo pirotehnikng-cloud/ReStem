@@ -5,8 +5,8 @@
 **Быстрое пакетное переименование файлов и каталогов на Rust**  
 **Fast Bulk File & Folder Renamer written in Rust**
 
-[![Version](https://img.shields.io/github/v/release/ВАШ_ЛОГИН/ВАШ_РЕПОЗИТОРИЙ?label=Version&color=2ea44f&logo=github)](CHANGELOG.md)
-[![Downloads](https://img.shields.io/github/downloads/ВАШ_ЛОГИН/ВАШ_РЕПОЗИТОРИЙ/total?label=Downloads&color=0078d4&logo=windows)](../../releases/latest)
+[![Version](https://img.shields.io/github/v/release/pirotehnikng-cloud/ReStem?label=Version&color=2ea44f&logo=github)](CHANGELOG.md)
+[![Downloads](https://img.shields.io/github/downloads/pirotehnikng-cloud/ReStem/total?label=Downloads&color=0078d4&logo=windows)](../../releases/latest)
 [![Language: Rust](https://img.shields.io/badge/Rust-2021_Edition-orange?logo=rust)](https://www.rust-lang.org/)
 [![GUI: egui](https://img.shields.io/badge/GUI-eframe_%2F_egui-00b4d8)](https://github.com/emilk/egui)
 [![License: MIT](https://img.shields.io/badge/License-MIT-success)](LICENSE)
