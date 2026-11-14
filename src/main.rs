@@ -13,8 +13,11 @@ use std::process::Command;
 use std::sync::Arc;
 use std::time::UNIX_EPOCH;
 
-const APP_LICENSE: &str = env!("CARGO_PKG_LICENSE");
 const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
+const APP_LICENSE: &str = match option_env!("CARGO_PKG_LICENSE") {
+    Some(lic) if !lic.is_empty() => lic,
+    _ => "GPL-3.0-only",
+};
 const GITHUB_REPO_URL: &str = match option_env!("CARGO_PKG_REPOSITORY") {
     Some(url) if !url.is_empty() => url,
     _ => "https://github.com/",
@@ -37,7 +40,7 @@ fn main() -> eframe::Result<()> {
                 APP_VERSION
             ))
             .with_inner_size([1380.0, 840.0])
-            .with_min_inner_size([1040.0, 620.0])
+            .with_min_inner_size([960.0, 600.0])
             .with_drag_and_drop(true)
             .with_icon(Arc::new(icon)),
         ..Default::default()
@@ -131,8 +134,8 @@ fn apply_theme_and_style(ctx: &egui::Context, dark_mode: bool) {
     ]
     .into();
 
-    style.spacing.item_spacing = egui::vec2(7.5, 5.5);
-    style.spacing.button_padding = egui::vec2(8.0, 4.0);
+    style.spacing.item_spacing = egui::vec2(7.0, 5.5);
+    style.spacing.button_padding = egui::vec2(7.5, 4.0);
 
     let mut visuals = if dark_mode {
         egui::Visuals::dark()
@@ -2399,9 +2402,10 @@ impl eframe::App for ReStemApp {
                             ui.colored_label(
                                 egui::Color32::from_rgb(24, 150, 105),
                                 format!(
-                                    "{}: v{} (Windows x64 Portable)",
+                                    "{}: v{} • {}",
                                     lang.tr("Версия", "Version"),
-                                    APP_VERSION
+                                    APP_VERSION,
+                                    APP_LICENSE
                                 ),
                             );
                         });
@@ -2429,7 +2433,7 @@ impl eframe::App for ReStemApp {
                             "Official GitHub Repository:",
                         ));
                         ui.weak(GITHUB_REPO_URL);
-                        ui.horizontal(|ui| {
+                        ui.horizontal_wrapped(|ui| {
                             if ui
                                 .button(lang.tr(
                                     "🌐 Открыть GitHub",
@@ -2459,7 +2463,7 @@ impl eframe::App for ReStemApp {
                             "Интеграция в контекстное меню Проводника Windows:",
                             "Windows Explorer Context Menu Integration:",
                         ));
-                        ui.horizontal(|ui| {
+                        ui.horizontal_wrapped(|ui| {
                             if ui
                                 .button(lang.tr(
                                     "➕ Добавить «Открыть в ReStem»",
@@ -2477,7 +2481,7 @@ impl eframe::App for ReStemApp {
                             }
                         });
                         ui.separator();
-                        ui.horizontal(|ui| {
+                        ui.horizontal_wrapped(|ui| {
                             ui.weak(lang.tr("Горячие клавиши:", "Shortcuts:"));
                             ui.label("Ctrl+O • F5 • Ctrl+Z • Del • Ctrl+Enter");
                         });
@@ -2490,8 +2494,8 @@ impl eframe::App for ReStemApp {
                             .clicked()
                         {
                             ctx.copy_text(format!(
-                                "ReStem v{} — {}",
-                                APP_VERSION, GITHUB_REPO_URL
+                                "ReStem v{} ({}) — {}",
+                                APP_VERSION, APP_LICENSE, GITHUB_REPO_URL
                             ));
                         }
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -2539,7 +2543,7 @@ impl eframe::App for ReStemApp {
                         "You can restore them anytime from the Windows Recycle Bin.",
                     ));
                     ui.add_space(10.0);
-                    ui.horizontal(|ui| {
+                    ui.horizontal_wrapped(|ui| {
                         let del_btn = egui::Button::new(
                             egui::RichText::new(lang.tr(
                                 "🗑 Да, переместить в Корзину",
@@ -2572,219 +2576,317 @@ impl eframe::App for ReStemApp {
             }
         }
 
-        // --- ВЕРХНЯЯ ПАНЕЛЬ ИНСТРУМЕНТОВ ---
+        // --- ВЕРХНЯЯ ПАНЕЛЬ ИНСТРУМЕНТОВ (АДАПТИВНАЯ БЕЗ НАЛОЖЕНИЯ БЛОКОВ) ---
         egui::TopBottomPanel::top("top_toolbar").show(ctx, |ui| {
-            ui.add_space(5.0);
-            ui.horizontal(|ui| {
-                let (rect, _) =
-                    ui.allocate_exact_size(egui::vec2(26.0, 26.0), egui::Sense::hover());
-                ui.painter()
-                    .rect_filled(rect, 6.0, egui::Color32::from_rgb(20, 30, 48));
-                ui.painter().text(
-                    rect.center(),
-                    egui::Align2::CENTER_CENTER,
-                    "R",
-                    egui::FontId::proportional(17.0),
-                    egui::Color32::from_rgb(35, 205, 175),
-                );
-                ui.strong(egui::RichText::new("ReStem").size(17.0));
-                ui.weak(format!("v{}", APP_VERSION));
-                ui.separator();
+            ui.add_space(4.0);
+            let total_top_width = ui.available_width();
 
-                if ui
-                    .button(lang.tr("📁 Папка...", "📁 Folder..."))
-                    .on_hover_text("Ctrl+O")
-                    .clicked()
-                {
-                    if let Some(folder) = rfd::FileDialog::new().pick_folder() {
-                        navigate_to = Some(folder);
-                    }
-                }
+            // Ряд 1: На широком экране (>= 1050 pt) разносим по краям, а на узком или при крупном шрифте — включаем плавный автоперенос
+            if total_top_width >= 1050.0 {
+                ui.horizontal(|ui| {
+                    let (rect, _) =
+                        ui.allocate_exact_size(egui::vec2(26.0, 26.0), egui::Sense::hover());
+                    ui.painter()
+                        .rect_filled(rect, 6.0, egui::Color32::from_rgb(20, 30, 48));
+                    ui.painter().text(
+                        rect.center(),
+                        egui::Align2::CENTER_CENTER,
+                        "R",
+                        egui::FontId::proportional(17.0),
+                        egui::Color32::from_rgb(35, 205, 175),
+                    );
+                    ui.strong(egui::RichText::new("ReStem").size(17.0));
+                    ui.weak(format!("v{}", APP_VERSION));
+                    ui.separator();
 
-                if ui
-                    .button(lang.tr("🔄 Обновить", "🔄 Refresh"))
-                    .on_hover_text("F5")
-                    .clicked()
-                {
-                    needs_reload = true;
-                }
-
-                if ui
-                    .button(lang.tr("☑ Инверт.", "☑ Invert"))
-                    .clicked()
-                {
-                    for row in &self.preview_rows {
-                        if self.excluded_paths.contains(&row.old_path) {
-                            self.excluded_paths.remove(&row.old_path);
-                        } else {
-                            self.excluded_paths.insert(row.old_path.clone());
+                    if ui
+                        .button(lang.tr("📁 Папка...", "📁 Folder..."))
+                        .on_hover_text("Ctrl+O")
+                        .clicked()
+                    {
+                        if let Some(folder) = rfd::FileDialog::new().pick_folder() {
+                            navigate_to = Some(folder);
                         }
                     }
-                    needs_recalc = true;
-                }
 
-                // Дублирующая яркая кнопка «Применить» прямо на верхней панели
-                let top_apply_label = match lang {
-                    Lang::Ru => format!("✔ Применить ({})", ready_to_rename_count),
-                    Lang::En => format!("✔ Apply ({})", ready_to_rename_count),
-                };
-                let top_apply_fill = if ready_to_rename_count > 0 {
-                    egui::Color32::from_rgb(16, 148, 92)
-                } else if is_dark {
-                    egui::Color32::from_rgb(42, 48, 60)
-                } else {
-                    egui::Color32::from_rgb(210, 216, 226)
-                };
-                let top_apply_fg = if ready_to_rename_count > 0 {
-                    egui::Color32::WHITE
-                } else if is_dark {
-                    egui::Color32::from_gray(160)
-                } else {
-                    egui::Color32::from_gray(105)
-                };
-                let top_apply_btn = egui::Button::new(
-                    egui::RichText::new(top_apply_label)
-                        .color(top_apply_fg)
-                        .strong(),
-                )
-                .fill(top_apply_fill);
-
-                if ui
-                    .add_enabled(ready_to_rename_count > 0, top_apply_btn)
-                    .on_hover_text(lang.tr(
-                        "Применить правила переименования (Ctrl+Enter)",
-                        "Apply rename rules (Ctrl+Enter)",
-                    ))
-                    .clicked()
-                {
-                    trigger_apply = true;
-                }
-
-                let undo_label = match lang {
-                    Lang::Ru => format!("↺ Откат ({})", self.undo_stack.len()),
-                    Lang::En => format!("↺ Undo ({})", self.undo_stack.len()),
-                };
-                if ui
-                    .add_enabled(!self.undo_stack.is_empty(), egui::Button::new(undo_label))
-                    .on_hover_text("Ctrl+Z")
-                    .clicked()
-                {
-                    trigger_undo = true;
-                }
-
-                if ui
-                    .add_enabled(
-                        !self.undo_stack.is_empty(),
-                        egui::Button::new(lang.tr("💾 .bat", "💾 .bat")),
-                    )
-                    .on_hover_text(lang.tr(
-                        "Экспортировать .bat-скрипт для отката последнего переименования",
-                        "Export .bat rollback script for the last batch rename",
-                    ))
-                    .clicked()
-                {
-                    self.export_rollback_script();
-                }
-
-                let trash_label = match lang {
-                    Lang::Ru => format!("🗑 В корзину ({})", checked_count),
-                    Lang::En => format!("🗑 Trash ({})", checked_count),
-                };
-                if ui
-                    .add_enabled(checked_count > 0, egui::Button::new(trash_label))
-                    .on_hover_text("Delete")
-                    .clicked()
-                {
-                    self.confirm_trash_modal = true;
-                }
-
-                ui.separator();
-
-                ui.label("🔍");
-                let search_hint = lang.tr("Поиск...", "Filter...");
-                if ui
-                    .add(
-                        egui::TextEdit::singleline(&mut self.search_query)
-                            .hint_text(search_hint)
-                            .desired_width(105.0),
-                    )
-                    .changed()
-                {
-                    needs_recalc = true;
-                }
-                if ui
-                    .selectable_label(self.search_case_sensitive, "Aa")
-                    .clicked()
-                {
-                    self.search_case_sensitive = !self.search_case_sensitive;
-                    needs_recalc = true;
-                }
-                if ui.selectable_label(self.search_regex, ".*").clicked() {
-                    self.search_regex = !self.search_regex;
-                    needs_recalc = true;
-                }
-                if !self.search_query.is_empty() && ui.small_button("✖").clicked() {
-                    self.search_query.clear();
-                    needs_recalc = true;
-                }
-
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui
-                        .button(lang.tr("ℹ О программе", "ℹ About"))
+                        .button(lang.tr("🔄 Обновить", "🔄 Refresh"))
+                        .on_hover_text("F5")
                         .clicked()
                     {
-                        self.show_about_modal = true;
+                        needs_reload = true;
                     }
 
                     if ui
-                        .button("🌐 GitHub")
-                        .on_hover_text(GITHUB_REPO_URL)
+                        .button(lang.tr("☑ Инверт.", "☑ Invert"))
                         .clicked()
                     {
-                        open_url_in_browser(GITHUB_REPO_URL);
-                    }
-
-                    ui.separator();
-
-                    if ui.selectable_label(self.lang == Lang::En, "EN").clicked() {
-                        self.lang = Lang::En;
-                        settings_dirty = true;
-                        needs_recalc = true;
-                    }
-                    if ui.selectable_label(self.lang == Lang::Ru, "RU").clicked() {
-                        self.lang = Lang::Ru;
-                        settings_dirty = true;
+                        for row in &self.preview_rows {
+                            if self.excluded_paths.contains(&row.old_path) {
+                                self.excluded_paths.remove(&row.old_path);
+                            } else {
+                                self.excluded_paths.insert(row.old_path.clone());
+                            }
+                        }
                         needs_recalc = true;
                     }
 
+                    let top_apply_label = match lang {
+                        Lang::Ru => format!("✔ Применить ({})", ready_to_rename_count),
+                        Lang::En => format!("✔ Apply ({})", ready_to_rename_count),
+                    };
+                    let top_apply_fill = if ready_to_rename_count > 0 {
+                        egui::Color32::from_rgb(16, 148, 92)
+                    } else if is_dark {
+                        egui::Color32::from_rgb(42, 48, 60)
+                    } else {
+                        egui::Color32::from_rgb(210, 216, 226)
+                    };
+                    let top_apply_fg = if ready_to_rename_count > 0 {
+                        egui::Color32::WHITE
+                    } else if is_dark {
+                        egui::Color32::from_gray(160)
+                    } else {
+                        egui::Color32::from_gray(105)
+                    };
+                    let top_apply_btn = egui::Button::new(
+                        egui::RichText::new(top_apply_label)
+                            .color(top_apply_fg)
+                            .strong(),
+                    )
+                    .fill(top_apply_fill);
+
+                    if ui
+                        .add_enabled(ready_to_rename_count > 0, top_apply_btn)
+                        .on_hover_text("Ctrl+Enter")
+                        .clicked()
+                    {
+                        trigger_apply = true;
+                    }
+
+                    let undo_label = match lang {
+                        Lang::Ru => format!("↺ Откат ({})", self.undo_stack.len()),
+                        Lang::En => format!("↺ Undo ({})", self.undo_stack.len()),
+                    };
+                    if ui
+                        .add_enabled(!self.undo_stack.is_empty(), egui::Button::new(undo_label))
+                        .on_hover_text("Ctrl+Z")
+                        .clicked()
+                    {
+                        trigger_undo = true;
+                    }
+
+                    if ui
+                        .add_enabled(
+                            !self.undo_stack.is_empty(),
+                            egui::Button::new(lang.tr("💾 .bat", "💾 .bat")),
+                        )
+                        .on_hover_text(lang.tr(
+                            "Экспортировать .bat-скрипт для отката",
+                            "Export .bat rollback script",
+                        ))
+                        .clicked()
+                    {
+                        self.export_rollback_script();
+                    }
+
+                    let trash_label = match lang {
+                        Lang::Ru => format!("🗑 В корзину ({})", checked_count),
+                        Lang::En => format!("🗑 Trash ({})", checked_count),
+                    };
+                    if ui
+                        .add_enabled(checked_count > 0, egui::Button::new(trash_label))
+                        .on_hover_text("Delete")
+                        .clicked()
+                    {
+                        self.confirm_trash_modal = true;
+                    }
+
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui
+                            .button(lang.tr("ℹ О программе", "ℹ About"))
+                            .clicked()
+                        {
+                            self.show_about_modal = true;
+                        }
+
+                        if ui
+                            .button("🌐 GitHub")
+                            .on_hover_text(GITHUB_REPO_URL)
+                            .clicked()
+                        {
+                            open_url_in_browser(GITHUB_REPO_URL);
+                        }
+
+                        ui.separator();
+
+                        if ui.selectable_label(self.lang == Lang::En, "EN").clicked() {
+                            self.lang = Lang::En;
+                            settings_dirty = true;
+                            needs_recalc = true;
+                        }
+                        if ui.selectable_label(self.lang == Lang::Ru, "RU").clicked() {
+                            self.lang = Lang::Ru;
+                            settings_dirty = true;
+                            needs_recalc = true;
+                        }
+
+                        ui.separator();
+
+                        if ui
+                            .small_button("A+")
+                            .on_hover_text(lang.tr("Увеличить масштаб", "Zoom In"))
+                            .clicked()
+                        {
+                            self.ui_scale = (self.ui_scale + 0.1).min(1.5);
+                            ctx.set_pixels_per_point(self.ui_scale);
+                            settings_dirty = true;
+                        }
+                        if ui
+                            .small_button(format!("{:.0}%", self.ui_scale * 100.0))
+                            .on_hover_text(lang.tr("Сбросить масштаб на 100%", "Reset scale to 100%"))
+                            .clicked()
+                        {
+                            self.ui_scale = 1.0;
+                            ctx.set_pixels_per_point(self.ui_scale);
+                            settings_dirty = true;
+                        }
+                        if ui
+                            .small_button("A-")
+                            .on_hover_text(lang.tr("Уменьшить масштаб", "Zoom Out"))
+                            .clicked()
+                        {
+                            self.ui_scale = (self.ui_scale - 0.1).max(0.85);
+                            ctx.set_pixels_per_point(self.ui_scale);
+                            settings_dirty = true;
+                        }
+
+                        ui.separator();
+
+                        let theme_label = if self.dark_mode {
+                            lang.tr("🌙 Тёмная", "🌙 Dark")
+                        } else {
+                            lang.tr("☀ Светлая", "☀ Light")
+                        };
+                        if ui.button(theme_label).clicked() {
+                            self.dark_mode = !self.dark_mode;
+                            apply_theme_and_style(ctx, self.dark_mode);
+                            settings_dirty = true;
+                        }
+                    });
+                });
+            } else {
+                // Адаптивный режим с автопереносом строк (без перекрытия при узком окне или крупном масштабе)
+                ui.horizontal_wrapped(|ui| {
+                    let (rect, _) =
+                        ui.allocate_exact_size(egui::vec2(24.0, 24.0), egui::Sense::hover());
+                    ui.painter()
+                        .rect_filled(rect, 6.0, egui::Color32::from_rgb(20, 30, 48));
+                    ui.painter().text(
+                        rect.center(),
+                        egui::Align2::CENTER_CENTER,
+                        "R",
+                        egui::FontId::proportional(16.0),
+                        egui::Color32::from_rgb(35, 205, 175),
+                    );
+                    ui.strong("ReStem");
+                    ui.weak(format!("v{}", APP_VERSION));
                     ui.separator();
 
                     if ui
-                        .small_button("A+")
-                        .on_hover_text(lang.tr("Увеличить масштаб", "Zoom In"))
+                        .button(lang.tr("📁 Папка...", "📁 Folder..."))
+                        .on_hover_text("Ctrl+O")
                         .clicked()
                     {
-                        self.ui_scale = (self.ui_scale + 0.1).min(1.5);
-                        ctx.set_pixels_per_point(self.ui_scale);
-                        settings_dirty = true;
+                        if let Some(folder) = rfd::FileDialog::new().pick_folder() {
+                            navigate_to = Some(folder);
+                        }
                     }
+
                     if ui
-                        .small_button(format!("{:.0}%", self.ui_scale * 100.0))
-                        .on_hover_text(lang.tr("Сбросить масштаб на 100%", "Reset scale to 100%"))
+                        .button(lang.tr("🔄 Обновить", "🔄 Refresh"))
+                        .on_hover_text("F5")
                         .clicked()
                     {
-                        self.ui_scale = 1.0;
-                        ctx.set_pixels_per_point(self.ui_scale);
-                        settings_dirty = true;
+                        needs_reload = true;
                     }
+
                     if ui
-                        .small_button("A-")
-                        .on_hover_text(lang.tr("Уменьшить масштаб", "Zoom Out"))
+                        .button(lang.tr("☑ Инверт.", "☑ Invert"))
                         .clicked()
                     {
-                        self.ui_scale = (self.ui_scale - 0.1).max(0.85);
-                        ctx.set_pixels_per_point(self.ui_scale);
-                        settings_dirty = true;
+                        for row in &self.preview_rows {
+                            if self.excluded_paths.contains(&row.old_path) {
+                                self.excluded_paths.remove(&row.old_path);
+                            } else {
+                                self.excluded_paths.insert(row.old_path.clone());
+                            }
+                        }
+                        needs_recalc = true;
+                    }
+
+                    let top_apply_label = match lang {
+                        Lang::Ru => format!("✔ Применить ({})", ready_to_rename_count),
+                        Lang::En => format!("✔ Apply ({})", ready_to_rename_count),
+                    };
+                    let top_apply_fill = if ready_to_rename_count > 0 {
+                        egui::Color32::from_rgb(16, 148, 92)
+                    } else if is_dark {
+                        egui::Color32::from_rgb(42, 48, 60)
+                    } else {
+                        egui::Color32::from_rgb(210, 216, 226)
+                    };
+                    let top_apply_fg = if ready_to_rename_count > 0 {
+                        egui::Color32::WHITE
+                    } else if is_dark {
+                        egui::Color32::from_gray(160)
+                    } else {
+                        egui::Color32::from_gray(105)
+                    };
+                    let top_apply_btn = egui::Button::new(
+                        egui::RichText::new(top_apply_label)
+                            .color(top_apply_fg)
+                            .strong(),
+                    )
+                    .fill(top_apply_fill);
+
+                    if ui
+                        .add_enabled(ready_to_rename_count > 0, top_apply_btn)
+                        .clicked()
+                    {
+                        trigger_apply = true;
+                    }
+
+                    let undo_label = match lang {
+                        Lang::Ru => format!("↺ Откат ({})", self.undo_stack.len()),
+                        Lang::En => format!("↺ Undo ({})", self.undo_stack.len()),
+                    };
+                    if ui
+                        .add_enabled(!self.undo_stack.is_empty(), egui::Button::new(undo_label))
+                        .clicked()
+                    {
+                        trigger_undo = true;
+                    }
+
+                    if ui
+                        .add_enabled(
+                            !self.undo_stack.is_empty(),
+                            egui::Button::new(lang.tr("💾 .bat", "💾 .bat")),
+                        )
+                        .clicked()
+                    {
+                        self.export_rollback_script();
+                    }
+
+                    let trash_label = match lang {
+                        Lang::Ru => format!("🗑 В корзину ({})", checked_count),
+                        Lang::En => format!("🗑 Trash ({})", checked_count),
+                    };
+                    if ui
+                        .add_enabled(checked_count > 0, egui::Button::new(trash_label))
+                        .clicked()
+                    {
+                        self.confirm_trash_modal = true;
                     }
 
                     ui.separator();
@@ -2799,13 +2901,88 @@ impl eframe::App for ReStemApp {
                         apply_theme_and_style(ctx, self.dark_mode);
                         settings_dirty = true;
                     }
+
+                    if ui.small_button("A-").clicked() {
+                        self.ui_scale = (self.ui_scale - 0.1).max(0.85);
+                        ctx.set_pixels_per_point(self.ui_scale);
+                        settings_dirty = true;
+                    }
+                    if ui
+                        .small_button(format!("{:.0}%", self.ui_scale * 100.0))
+                        .clicked()
+                    {
+                        self.ui_scale = 1.0;
+                        ctx.set_pixels_per_point(self.ui_scale);
+                        settings_dirty = true;
+                    }
+                    if ui.small_button("A+").clicked() {
+                        self.ui_scale = (self.ui_scale + 0.1).min(1.5);
+                        ctx.set_pixels_per_point(self.ui_scale);
+                        settings_dirty = true;
+                    }
+
+                    if ui.selectable_label(self.lang == Lang::Ru, "RU").clicked() {
+                        self.lang = Lang::Ru;
+                        settings_dirty = true;
+                        needs_recalc = true;
+                    }
+                    if ui.selectable_label(self.lang == Lang::En, "EN").clicked() {
+                        self.lang = Lang::En;
+                        settings_dirty = true;
+                        needs_recalc = true;
+                    }
+
+                    if ui.button("🌐 GitHub").clicked() {
+                        open_url_in_browser(GITHUB_REPO_URL);
+                    }
+                    if ui
+                        .button(lang.tr("ℹ О программе", "ℹ About"))
+                        .clicked()
+                    {
+                        self.show_about_modal = true;
+                    }
                 });
-            });
+            }
 
             ui.separator();
 
-            // Ряд 2: Панель фильтрации, Diff-режима и сортировки
-            ui.horizontal(|ui| {
+            // Ряд 2: Поиск, фильтрация, Diff-режим и сортировка (с поддержкой автопереноса horizontal_wrapped)
+            ui.horizontal_wrapped(|ui| {
+                ui.label("🔍");
+                let search_hint = lang.tr("Поиск...", "Filter...");
+                if ui
+                    .add(
+                        egui::TextEdit::singleline(&mut self.search_query)
+                            .hint_text(search_hint)
+                            .desired_width(115.0),
+                    )
+                    .changed()
+                {
+                    needs_recalc = true;
+                }
+                if ui
+                    .selectable_label(self.search_case_sensitive, "Aa")
+                    .on_hover_text(lang.tr("Учитывать регистр", "Case-sensitive"))
+                    .clicked()
+                {
+                    self.search_case_sensitive = !self.search_case_sensitive;
+                    needs_recalc = true;
+                }
+                if ui
+                    .selectable_label(self.search_regex, ".*")
+                    .on_hover_text("Regex")
+                    .clicked()
+                {
+                    self.search_regex = !self.search_regex;
+                    needs_recalc = true;
+                }
+                if !self.search_query.is_empty() && ui.small_button("✖").clicked() {
+                    self.search_query.clear();
+                    needs_recalc = true;
+                }
+
+                ui.separator();
+
                 needs_recalc |= ui
                     .checkbox(&mut self.include_files, lang.tr("Файлы", "Files"))
                     .changed();
@@ -2833,7 +3010,7 @@ impl eframe::App for ReStemApp {
                 if ui
                     .checkbox(
                         &mut self.inline_diff,
-                        lang.tr("🎨 Diff-подсветка букв", "🎨 Inline Diff"),
+                        lang.tr("🎨 Diff-буквы", "🎨 Inline Diff"),
                     )
                     .changed()
                 {
@@ -2844,7 +3021,7 @@ impl eframe::App for ReStemApp {
 
                 ui.label(lang.tr("Показать:", "Show:"));
                 egui::ComboBox::from_id_salt("status_filter_cb")
-                    .width(145.0)
+                    .width(135.0)
                     .selected_text(match self.status_filter {
                         StatusFilter::All => lang.tr("Все объекты", "All items"),
                         StatusFilter::OnlyChanged => lang.tr("Только изменяемые", "Only changing"),
@@ -2886,7 +3063,7 @@ impl eframe::App for ReStemApp {
 
                 ui.strong(lang.tr("Сортировка:", "Sort:"));
                 egui::ComboBox::from_id_salt("sort_field_cb")
-                    .width(175.0)
+                    .width(165.0)
                     .selected_text(match self.sort_field {
                         SortField::NaturalName => {
                             lang.tr("Умная по имени (1, 2, 10)", "Natural Name (1, 2, 10)")
@@ -2962,30 +3139,43 @@ impl eframe::App for ReStemApp {
             ui.add_space(3.0);
         });
 
-        // --- НИЖНЯЯ СТРОКА СОСТОЯНИЯ ---
+        // --- НИЖНЯЯ СТРОКА СОСТОЯНИЯ (БЕЗ ПЕРЕКРЫТИЯ ПУТИ И СЧЁТЧИКОВ) ---
         egui::TopBottomPanel::bottom("status_footer").show(ctx, |ui| {
             ui.add_space(2.0);
-            ui.horizontal(|ui| {
-                ui.strong(&self.status_msg);
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    let path_str = self
-                        .current_dir
-                        .as_ref()
-                        .map(|p| p.display().to_string())
-                        .unwrap_or_else(|| {
-                            lang.tr("Папка не выбрана", "No folder selected").to_string()
-                        });
-                    ui.label(path_str);
+            let path_str = self
+                .current_dir
+                .as_ref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| {
+                    lang.tr("Папка не выбрана", "No folder selected").to_string()
                 });
-            });
+
+            if ui.available_width() >= 900.0 {
+                ui.horizontal(|ui| {
+                    ui.strong(&self.status_msg);
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.add(egui::Label::new(path_str).truncate());
+                    });
+                });
+            } else {
+                ui.horizontal_wrapped(|ui| {
+                    ui.strong(&self.status_msg);
+                    ui.separator();
+                    ui.weak(path_str);
+                });
+            }
             ui.add_space(2.0);
         });
+
+        let screen_w = ctx.screen_rect().width();
+        let left_max_w = (screen_w * 0.27).clamp(210.0, 380.0);
+        let right_max_w = (screen_w * 0.33).clamp(265.0, 440.0);
 
         // --- ЛЕВАЯ КОЛОНКА: ПАПКИ, ПРЕДПРОСМОТР И СОХРАНЯЕМЫЕ ПРЕСЕТЫ ---
         egui::SidePanel::left("left_explorer_panel")
             .resizable(true)
-            .default_width(275.0)
-            .width_range(225.0..=395.0)
+            .default_width(265.0)
+            .width_range(195.0..=left_max_w)
             .show(ctx, |ui| {
                 egui::ScrollArea::vertical()
                     .id_salt("left_panel_main_scroll")
@@ -3144,7 +3334,7 @@ impl eframe::App for ReStemApp {
 
                             if let Some(sel_path) = &self.selected_path {
                                 ui.add_space(6.0);
-                                ui.horizontal(|ui| {
+                                ui.horizontal_wrapped(|ui| {
                                     if ui
                                         .button(lang.tr("🚀 Открыть", "🚀 Open"))
                                         .clicked()
@@ -3256,11 +3446,11 @@ impl eframe::App for ReStemApp {
                             }
 
                             ui.separator();
-                            ui.horizontal(|ui| {
+                            ui.horizontal_wrapped(|ui| {
                                 ui.add(
                                     egui::TextEdit::singleline(&mut self.new_preset_title)
                                         .hint_text(lang.tr("Имя пресета...", "Preset name..."))
-                                        .desired_width(145.0),
+                                        .desired_width(130.0),
                                 );
                                 if ui
                                     .button(lang.tr("➕ Сохранить", "➕ Save"))
@@ -3289,8 +3479,8 @@ impl eframe::App for ReStemApp {
         // --- ПРАВАЯ КОЛОНКА: ЗАКРЕПЛЁННЫЙ НИЖНИЙ ДОК + ПРОКРУЧИВАЕМЫЕ ПРАВИЛА ---
         egui::SidePanel::right("right_rules_panel")
             .resizable(true)
-            .default_width(340.0)
-            .width_range(295.0..=450.0)
+            .default_width(330.0)
+            .width_range(260.0..=right_max_w)
             .show(ctx, |ui| {
                 // 1. Закреплённый нижний блок (Sticky Footer) — ВСЕГДА виден без прокрутки
                 let (dock_bg, dock_border) = if ready_to_rename_count > 0 {
@@ -3325,7 +3515,7 @@ impl eframe::App for ReStemApp {
                 egui::TopBottomPanel::bottom("right_sticky_apply_bar")
                     .frame(sticky_frame)
                     .show_inside(ui, |ui| {
-                        ui.horizontal(|ui| {
+                        ui.horizontal_wrapped(|ui| {
                             if ready_to_rename_count > 0 {
                                 let badge_col = if is_dark {
                                     egui::Color32::from_rgb(95, 235, 160)
@@ -3336,7 +3526,7 @@ impl eframe::App for ReStemApp {
                                     badge_col,
                                     match lang {
                                         Lang::Ru => format!(
-                                            "⚡ Готово к переименованию: {} шт.",
+                                            "⚡ К переименованию: {} шт.",
                                             ready_to_rename_count
                                         ),
                                         Lang::En => format!(
@@ -3347,26 +3537,21 @@ impl eframe::App for ReStemApp {
                                 );
                             } else {
                                 ui.weak(lang.tr(
-                                    "Задайте правила выше для предпросмотра",
-                                    "Adjust rules above to preview changes",
+                                    "Задайте правила выше",
+                                    "Adjust rules above",
                                 ));
                             }
 
-                            ui.with_layout(
-                                egui::Layout::right_to_left(egui::Align::Center),
-                                |ui| {
-                                    if ui
-                                        .small_button(lang.tr("✖ Сброс", "✖ Reset"))
-                                        .on_hover_text(lang.tr(
-                                            "Сбросить все правила и фильтры",
-                                            "Reset all rules and filters",
-                                        ))
-                                        .clicked()
-                                    {
-                                        trigger_reset = true;
-                                    }
-                                },
-                            );
+                            if ui
+                                .small_button(lang.tr("✖ Сброс правил", "✖ Reset Rules"))
+                                .on_hover_text(lang.tr(
+                                    "Сбросить все правила и фильтры",
+                                    "Reset all rules and filters",
+                                ))
+                                .clicked()
+                            {
+                                trigger_reset = true;
+                            }
                         });
 
                         ui.add_space(4.0);
@@ -3374,11 +3559,11 @@ impl eframe::App for ReStemApp {
                         let main_btn_label = if ready_to_rename_count > 0 {
                             match lang {
                                 Lang::Ru => format!(
-                                    "✔ Применить изменения ({})  [Ctrl+Enter]",
+                                    "✔ Применить изменения ({})",
                                     ready_to_rename_count
                                 ),
                                 Lang::En => format!(
-                                    "✔ Apply Changes ({})  [Ctrl+Enter]",
+                                    "✔ Apply Changes ({})",
                                     ready_to_rename_count
                                 ),
                             }
@@ -3405,12 +3590,12 @@ impl eframe::App for ReStemApp {
                         let btn_text = egui::RichText::new(main_btn_label)
                             .color(btn_fg)
                             .strong()
-                            .size(15.5);
+                            .size(15.0);
 
                         let apply_btn = egui::Button::new(btn_text)
                             .fill(btn_fill)
                             .rounding(7.0)
-                            .min_size(egui::vec2(ui.available_width(), 44.0));
+                            .min_size(egui::vec2(ui.available_width(), 42.0));
 
                         if ui.add(apply_btn).clicked() {
                             trigger_apply = true;
@@ -3419,45 +3604,40 @@ impl eframe::App for ReStemApp {
 
                 // 2. Заголовок правой панели
                 ui.add_space(4.0);
-                ui.horizontal(|ui| {
+                ui.horizontal_wrapped(|ui| {
                     ui.heading(lang.tr("Правила", "Rename Rules"));
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        let list_btn_txt = if self.use_custom_list {
-                            lang.tr("📋 По списку (ВКЛ)", "📋 From List (ON)")
-                        } else {
-                            lang.tr("📋 По списку...", "📋 From List...")
-                        };
-                        if ui.button(list_btn_txt).clicked() {
-                            self.show_list_rename_modal = true;
-                        }
-                    });
+                    let list_btn_txt = if self.use_custom_list {
+                        lang.tr("📋 По списку (ВКЛ)", "📋 From List (ON)")
+                    } else {
+                        lang.tr("📋 По списку...", "📋 From List...")
+                    };
+                    if ui.button(list_btn_txt).clicked() {
+                        self.show_list_rename_modal = true;
+                    }
                 });
                 ui.add_space(4.0);
 
-                // 3. Прокручиваемая область карточек правил (занимает пространство над кнопкой)
+                // 3. Прокручиваемая область карточек правил
                 egui::ScrollArea::vertical()
                     .id_salt("rules_scroll")
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
+                        let combo_w = (ui.available_width() - 24.0).max(160.0);
+
                         card_frame(is_dark).show(ui, |ui| {
                             ui.set_min_width(ui.available_width());
-                            ui.horizontal(|ui| {
+                            ui.horizontal_wrapped(|ui| {
                                 section_title(
                                     ui,
                                     lang.tr("1. Поиск и замена", "1. Find & Replace"),
                                     is_dark,
                                 );
-                                ui.with_layout(
-                                    egui::Layout::right_to_left(egui::Align::Center),
-                                    |ui| {
-                                        if ui
-                                            .small_button(lang.tr("[?] Regex", "[?] Regex"))
-                                            .clicked()
-                                        {
-                                            self.show_regex_help_modal = true;
-                                        }
-                                    },
-                                );
+                                if ui
+                                    .small_button(lang.tr("[?] Regex", "[?] Regex"))
+                                    .clicked()
+                                {
+                                    self.show_regex_help_modal = true;
+                                }
                             });
                             ui.add_space(4.0);
                             ui.label(lang.tr("Найти текст:", "Find text:"));
@@ -3496,7 +3676,7 @@ impl eframe::App for ReStemApp {
                             );
                             ui.add_space(4.0);
                             egui::ComboBox::from_id_salt("case_cb")
-                                .width(265.0)
+                                .width(combo_w)
                                 .selected_text(match self.case_mode {
                                     CaseMode::None => {
                                         lang.tr("Не менять регистр", "Default (No change)")
@@ -3554,7 +3734,7 @@ impl eframe::App for ReStemApp {
                             ui.add_space(4.0);
                             ui.label(lang.tr("Транслитерация:", "Transliteration:"));
                             egui::ComboBox::from_id_salt("translit_cb")
-                                .width(265.0)
+                                .width(combo_w)
                                 .selected_text(match self.translit_mode {
                                     TranslitMode::None => lang.tr("Выключена", "Disabled"),
                                     TranslitMode::RuToLat => {
@@ -3692,7 +3872,7 @@ impl eframe::App for ReStemApp {
                             );
                             ui.add_space(4.0);
                             egui::ComboBox::from_id_salt("num_cb")
-                                .width(265.0)
+                                .width(combo_w)
                                 .selected_text(match self.num_mode {
                                     NumMode::None => lang.tr("Выключена", "Disabled"),
                                     NumMode::Suffix => {
@@ -3733,7 +3913,7 @@ impl eframe::App for ReStemApp {
                                         .changed();
                                 });
 
-                            ui.horizontal(|ui| {
+                            ui.horizontal_wrapped(|ui| {
                                 ui.label(lang.tr("Старт:", "Start:"));
                                 needs_recalc |= ui
                                     .add(egui::DragValue::new(&mut self.num_start).range(0..=99999))
@@ -3744,7 +3924,7 @@ impl eframe::App for ReStemApp {
                                     .changed();
                             });
 
-                            ui.horizontal(|ui| {
+                            ui.horizontal_wrapped(|ui| {
                                 ui.label(lang.tr("Цифр (001):", "Zero pad:"));
                                 needs_recalc |= ui
                                     .add(egui::DragValue::new(&mut self.num_pad).range(1..=10))
@@ -3782,7 +3962,7 @@ impl eframe::App for ReStemApp {
 
                             ui.label(lang.tr("Режим расширения:", "Extension mode:"));
                             egui::ComboBox::from_id_salt("ext_mode_cb")
-                                .width(265.0)
+                                .width(combo_w)
                                 .selected_text(match self.ext_mode {
                                     ExtMode::Keep => lang.tr("Не менять", "Keep original"),
                                     ExtMode::Lower => {
@@ -3867,7 +4047,7 @@ impl eframe::App for ReStemApp {
 
                             ui.label(lang.tr("Фильтр по размеру:", "File size filter:"));
                             egui::ComboBox::from_id_salt("size_filter_cb")
-                                .width(265.0)
+                                .width(combo_w)
                                 .selected_text(match self.size_filter_mode {
                                     SizeFilterMode::Any => lang.tr("Любой размер", "Any size"),
                                     SizeFilterMode::GreaterThanKB => {
@@ -3912,7 +4092,7 @@ impl eframe::App for ReStemApp {
                                 });
 
                             if self.size_filter_mode != SizeFilterMode::Any {
-                                ui.horizontal(|ui| {
+                                ui.horizontal_wrapped(|ui| {
                                     if self.size_filter_mode == SizeFilterMode::GreaterThanKB
                                         || self.size_filter_mode == SizeFilterMode::BetweenKB
                                     {
@@ -3970,7 +4150,7 @@ impl eframe::App for ReStemApp {
                 self.undo_rename();
             }
 
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 ui.heading(lang.tr("Файлы и папки для переименования", "Files to Rename"));
                 ui.weak(lang.tr(
                     "• Клик — превью • Двойной клик — открыть • Шапка столбца — сортировка",
@@ -4026,8 +4206,8 @@ impl eframe::App for ReStemApp {
                     .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
                     .column(Column::exact(34.0))
                     .column(Column::initial(92.0).resizable(true))
-                    .column(Column::initial(235.0).resizable(true))
-                    .column(Column::initial(235.0).resizable(true))
+                    .column(Column::initial(220.0).resizable(true))
+                    .column(Column::initial(220.0).resizable(true))
                     .column(Column::initial(90.0).resizable(true))
                     .column(Column::initial(85.0).resizable(true))
                     .column(Column::remainder())
