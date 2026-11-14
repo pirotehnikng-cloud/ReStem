@@ -13,6 +13,7 @@ use std::process::Command;
 use std::sync::Arc;
 use std::time::UNIX_EPOCH;
 
+const APP_LICENSE: &str = env!("CARGO_PKG_LICENSE");
 const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 const GITHUB_REPO_URL: &str = match option_env!("CARGO_PKG_REPOSITORY") {
     Some(url) if !url.is_empty() => url,
