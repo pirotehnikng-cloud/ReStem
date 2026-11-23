@@ -13,7 +13,7 @@
 
 <br>
 
-[![Скачать ReStem v1.3.0](https://img.shields.io/badge/⬇_Скачать_ReStem_v1.3.0-Прямая_ссылка_(.exe)-0078d4?style=for-the-badge&logo=windows&logoColor=white)](../../releases/latest/download/restem_1.3.0.exe)
+[![Скачать ReStem v1.4.0](https://img.shields.io/badge/⬇_Скачать_ReStem_v1.4.0-Прямая_ссылка_(.exe)-0078d4?style=for-the-badge&logo=windows&logoColor=white)](../../releases/latest/download/restem_1.4.0.exe)
 
 <br>
 
@@ -27,24 +27,34 @@
 
 **ReStem** — это легковесная нативная десктопная утилита для пакетного переименования файлов и каталогов, написанная на языке **Rust** с использованием графического движка `eframe` (`egui`). Программа работает из единого портативного `.exe` файла, запускается за миллисекунды, не требует установки сторонних библиотек и плавно отображает десятки тысяч объектов благодаря виртуальной таблице.
 
-### ✨ Ключевые возможности (v1.3.0)
+### ✨ Ключевые возможности (v1.4.0)
 
-* **Умные теги (Smart Tags) и чтение метаданных EXIF:**
+* **Умные теги (Smart Tags), EXIF и MediaInfo для видео:**
   * Динамическая подстановка переменных прямо в полях префикса, суффикса, вставки по позиции и замены:
     * `{date}`, `{year}`, `{month}`, `{day}` — дата изменения файла (`ГГГГ-ММ-ДД`).
     * `{exif_date}` — реальная дата съёмки фотографии из EXIF-заголовка JPEG.
     * `{camera}` — модель фотокамеры или смартфона из EXIF (например, `Canon_EOS_R6`).
     * `{parent}` — имя родительской папки файла.
-    * `{w}x{h}`, `{w}`, `{h}` — точное разрешение изображения в пикселях (например, `1920x1080`), считываемое из заголовка файла без декодирования всей картинки.
+    * `{w}x{h}`, `{w}`, `{h}` — точное разрешение изображения или видео в пикселях (например, `1920x1080`), считываемое из заголовка файла.
+  * **Видео-теги MediaInfo** (встроенный портативный парсер `MP4`, `M4V`, `MOV`, `3GP`, `MKV`, `WebM`, `AVI`, `FLV` + автоматический fallback через `MediaInfo CLI` или `ffprobe` из `PATH` для `TS`, `M2TS`, `WMV`, `MPG`, `VOB`, `OGV`):
+    * `{res}` — класс качества (`4320p`, `2160p`, `1440p`, `1080p`, `720p`, `480p` и др.).
+    * `{vcodec}` — видеокодек (`H264`, `HEVC`, `AV1`, `VP9`, `ProRes`, `Xvid` и др.).
+    * `{acodec}` и `{ach}` — аудиокодек (`AAC`, `AC3`, `EAC3`, `Opus`, `DTS`, `FLAC` и др.) и конфигурация каналов (`1.0`, `2.0`, `5.1`, `7.1`).
+    * `{fps}` — частота кадров (`23.98fps`, `24fps`, `60fps`).
+    * `{duration}` — длительность в безопасном для имён формате (`04m35s`, `01h02m05s`).
+    * `{bitrate}` — общий битрейт (`15Mbps`, `850kbps`).
+    * `{hdr}` — формат расширенного динамического диапазона (`HDR10`, `HLG`, `DV`).
+    * `{media_date}` — дата съёмки/кодирования из метаданных видео (`ГГГГ-ММ-ДД`).
 * **Посимвольная Diff-подсветка в реальном времени:**
   * Переключатель **«🎨 Diff-подсветка букв»** на верхней панели наглядно выделяет красным зачёркнутым шрифтом удаляемые фрагменты в текущем имени и ярко-зелёным — добавленные или изменённые символы в новом имени.
 * **Работа с файлами, папками и вложенными подкаталогами:**
   * Гибкая фильтрация объектов: переименовывайте только файлы, только папки или всё дерево каталогов рекурсивно.
   * **Безопасный иерархический обход (Bottom-Up):** при переименовании вложенных структур программа автоматически начинает с самого глубокого уровня вложенности и движется к корню, исключая ошибки потери пути.
   * У папок с точками в названии (например, `Отчет_2026.11`) часть после точки не воспринимается как расширение файла — имя каталога обрабатывается целиком.
-* **Встроенный предпросмотр изображений, EXIF, текста и папок:**
+* **Встроенный предпросмотр изображений, видео MediaInfo, EXIF, текста и папок:**
   * **Одиночный клик** по имени объекта в таблице открывает его в карточке **«👁 Предпросмотр объекта»** на левой панели, а **двойной клик** открывает файл в системной программе Windows по умолчанию:
     * **Изображения (`jpg`, `jpeg`, `png`, `webp`, `bmp`, `ico`, `gif`):** масштабируемая миниатюра с указанием разрешения в пикселях, даты съёмки EXIF и модели камеры.
+    * **Видео (`mp4`, `mkv`, `mov`, `avi`, `webm`, `m4v`, `flv`, `ts`, `wmv` и др.):** карточка MediaInfo с разрешением, типом качества (`1080p` / `2160p`), HDR, видео- и аудиокодеками, каналами звука, FPS, длительностью, битрейтом и датой записи.
     * **Текстовые файлы и исходный код (`txt`, `md`, `json`, `csv`, `log`, `ini`, `rs`, `py` и др.):** мгновенный предпросмотр первых 4 КБ содержимого моноширинным шрифтом `Consolas` с автоматическим распознаванием бинарных файлов.
     * **Папки:** отображение количества вложенных объектов и кнопка быстрого перехода внутрь каталога.
 * **Безопасное удаление в Корзину Windows:**
@@ -98,8 +108,8 @@
 
 ### 🚀 Скачивание и запуск
 
-1. Скачайте портативный исполняемый файл по [**прямой ссылке (`restem_1.3.0.exe`)**](../../releases/latest/download/restem_1.3.0.exe) или со страницы [**Releases**](../../releases) (история версий в [**CHANGELOG.md**](CHANGELOG.md)).
-2. Запустите `restem_1.3.0.exe` — установка не требуется.
+1. Скачайте портативный исполняемый файл по [**прямой ссылке (`restem_1.4.0.exe`)**](../../releases/latest/download/restem_1.4.0.exe) или со страницы [**Releases**](../../releases) (история версий в [**CHANGELOG.md**](CHANGELOG.md)).
+2. Запустите `restem_1.4.0.exe` — установка не требуется.
 3. Нажмите **«📁 Папка...»** (`Ctrl+O`), перетащите каталог мышью в окно программы или откройте папку через контекстное меню Проводника Windows.
 
 ---
@@ -119,23 +129,33 @@
 
 **ReStem** is a lightweight, native desktop utility for batch renaming files and directories, built in **Rust** using the `eframe` (`egui`) immediate-mode GUI framework. It runs from a single portable `.exe` with zero external dependencies, launches instantaneously, and smoothly handles tens of thousands of items using virtual table rendering.
 
-### ✨ Key Features (v1.3.0)
+### ✨ Key Features (v1.4.0)
 
-* **Smart Tags & Built-In EXIF Reader:**
+* **Smart Tags, EXIF & Video MediaInfo Reader:**
   * Dynamically insert metadata variables into Prefix, Suffix, Index Insertion, and Replacement fields:
     * `{date}`, `{year}`, `{month}`, `{day}` — file modification date (`YYYY-MM-DD`).
     * `{exif_date}` — original photo capture date extracted directly from JPEG EXIF headers.
     * `{camera}` — camera or smartphone model from EXIF metadata (e.g., `Canon_EOS_R6`).
     * `{parent}` — parent directory name.
-    * `{w}x{h}`, `{w}`, `{h}` — exact image dimensions in pixels (e.g., `1920x1080`) read instantaneously from image headers.
+    * `{w}x{h}`, `{w}`, `{h}` — exact image or video dimensions in pixels (e.g., `1920x1080`) read instantaneously from file headers.
+  * **Video MediaInfo Tags** (built-in portable parser for `MP4`, `M4V`, `MOV`, `3GP`, `MKV`, `WebM`, `AVI`, `FLV` + automatic `MediaInfo CLI` / `ffprobe` fallback from `PATH` for `TS`, `M2TS`, `WMV`, `MPG`, `VOB`, `OGV`):
+    * `{res}` — quality tier (`4320p`, `2160p`, `1440p`, `1080p`, `720p`, `480p`, etc.).
+    * `{vcodec}` — video codec (`H264`, `HEVC`, `AV1`, `VP9`, `ProRes`, `Xvid`, etc.).
+    * `{acodec}` and `{ach}` — audio codec (`AAC`, `AC3`, `EAC3`, `Opus`, `DTS`, `FLAC`, etc.) and channel layout (`1.0`, `2.0`, `5.1`, `7.1`).
+    * `{fps}` — frame rate (`23.98fps`, `24fps`, `60fps`).
+    * `{duration}` — filename-safe duration (`04m35s`, `01h02m05s`).
+    * `{bitrate}` — overall bitrate (`15Mbps`, `850kbps`).
+    * `{hdr}` — HDR format (`HDR10`, `HLG`, `DV`).
+    * `{media_date}` — recorded/encoded date from video metadata (`YYYY-MM-DD`).
 * **Real-Time Inline Character Diff:**
   * Toggle **🎨 Inline Diff** in the top toolbar to highlight removed characters in red strikethrough and newly inserted characters in green directly inside filenames.
 * **Files, Folders & Recursive Subdirectories:**
   * Rename files, folders, or entire directory trees recursively using **Safe Bottom-Up Traversal** so parent folder renames never invalidate child paths.
   * Folder names containing dots (e.g., `Report_2026.11`) are treated as complete names rather than split into file extensions.
-* **Built-In Image, EXIF, Text & Folder Preview:**
+* **Built-In Image, Video MediaInfo, EXIF, Text & Folder Preview:**
   * **Single-click** any item in the table to inspect it in the **👁 Item Preview** card, or **double-click** to open it in the default Windows application:
     * **Images (`jpg`, `jpeg`, `png`, `webp`, `bmp`, `ico`, `gif`):** proportional thumbnail preview with pixel dimensions, EXIF date, and camera model.
+    * **Videos (`mp4`, `mkv`, `mov`, `avi`, `webm`, `m4v`, `flv`, `ts`, `wmv`, etc.):** MediaInfo card showing resolution, quality tier (`1080p` / `2160p`), HDR, video & audio codecs, channels, FPS, duration, bitrate, and recorded date.
     * **Text & Code Files (`txt`, `md`, `json`, `csv`, `log`, `ini`, `rs`, `py`, etc.):** instant preview of the first 4 KB of text in `Consolas` monospace font with automatic binary file detection.
     * **Folders:** displays item count and a quick button to enter the directory.
 * **Safe Deletion to Windows Recycle Bin:**
@@ -185,8 +205,8 @@
 
 ### 🚀 Download & Usage
 
-1. Download [**`restem_1.3.0.exe` (Direct Download)**](../../releases/latest/download/restem_1.3.0.exe) or visit the [**Releases**](../../releases) page (see [**CHANGELOG.md**](CHANGELOG.md) for version history).
-2. Run `restem_1.3.0.exe` — no installation or runtime required.
+1. Download [**`restem_1.4.0.exe` (Direct Download)**](../../releases/latest/download/restem_1.4.0.exe) or visit the [**Releases**](../../releases) page (see [**CHANGELOG.md**](CHANGELOG.md) for version history).
+2. Run `restem_1.4.0.exe` — no installation or runtime required.
 3. Click **📁 Folder...** (`Ctrl+O`), drag and drop a folder into the window, or open any folder via the Windows Explorer context menu.
 
 ---

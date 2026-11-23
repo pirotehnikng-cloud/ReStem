@@ -1,5 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod media_info;
+
 use eframe::egui;
 use egui_extras::{Column, TableBuilder};
 use regex::RegexBuilder;
@@ -294,7 +296,7 @@ fn natural_cmp(a: &str, b: &str) -> Ordering {
 }
 
 /// Разбор UNIX-времени на (год, месяц, день, часы, минуты)
-fn decompose_timestamp(secs: u64) -> (i64, u32, u32, u64, u64) {
+pub(crate) fn decompose_timestamp(secs: u64) -> (i64, u32, u32, u64, u64) {
     if secs == 0 {
         return (1970, 1, 1, 0, 0);
     }
@@ -848,6 +850,11 @@ enum PreviewState {
         exif_info: String,
         tex_size: egui::Vec2,
     },
+    Video {
+        name: String,
+        info: media_info::VideoMediaInfo,
+        size_bytes: u64,
+    },
     Text {
         name: String,
         content: String,
@@ -875,6 +882,7 @@ struct FsEntry {
     img_dims: Option<(u32, u32)>,
     exif_date: Option<String>,
     exif_camera: Option<String>,
+    video_info: Option<media_info::VideoMediaInfo>,
 }
 
 #[derive(Clone)]
@@ -883,6 +891,7 @@ struct PreviewRow {
     parent_dir: PathBuf,
     rel_parent: String,
     is_dir: bool,
+    is_video: bool,
     depth: usize,
     size: u64,
     modified_ts: u64,
@@ -897,6 +906,7 @@ struct ReStemApp {
     dark_mode: bool,
     ui_scale: f32,
     inline_diff: bool,
+    use_external_mediainfo: bool,
 
     current_dir: Option<PathBuf>,
     subfolders: Vec<PathBuf>,
@@ -976,6 +986,7 @@ impl Default for ReStemApp {
             dark_mode: false,
             ui_scale: 1.0,
             inline_diff: true,
+            use_external_mediainfo: true,
 
             current_dir: None,
             subfolders: Vec::new(),
@@ -1055,6 +1066,10 @@ impl ReStemApp {
         lines.push(format!("dark_mode={}", self.dark_mode));
         lines.push(format!("ui_scale={:.2}", self.ui_scale));
         lines.push(format!("inline_diff={}", self.inline_diff));
+        lines.push(format!(
+            "use_external_mediainfo={}",
+            self.use_external_mediainfo
+        ));
 
         for p in &self.user_presets {
             let t_code = match p.translit_mode {
@@ -1102,6 +1117,8 @@ impl ReStemApp {
                 }
             } else if let Some(val) = line.strip_prefix("inline_diff=") {
                 self.inline_diff = val.trim() == "true";
+            } else if let Some(val) = line.strip_prefix("use_external_mediainfo=") {
+                self.use_external_mediainfo = val.trim() != "false";
             } else if let Some(val) = line.strip_prefix("preset=") {
                 let parts: Vec<&str> = val.split('\t').collect();
                 if parts.len() == 9 {
@@ -1348,6 +1365,25 @@ impl ReStemApp {
             return;
         }
 
+        if media_info::is_video_ext(&ext) {
+            let size_bytes = fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+            let info = self
+                .all_entries
+                .iter()
+                .find(|e| e.path == path)
+                .and_then(|e| e.video_info.clone())
+                .or_else(|| {
+                    media_info::extract_video_info(&path, size_bytes, self.use_external_mediainfo)
+                })
+                .unwrap_or_default();
+            self.preview_state = PreviewState::Video {
+                name,
+                info,
+                size_bytes,
+            };
+            return;
+        }
+
         match fs::File::open(&path) {
             Ok(file) => {
                 let mut buf = Vec::with_capacity(4096);
@@ -1533,17 +1569,22 @@ impl ReStemApp {
                     .to_lowercase()
             };
 
-            let (img_dims, exif_date, exif_camera) = if !is_dir && is_image_ext(&ext_lower) {
-                let dims = image::image_dimensions(&path).ok();
-                let (ed, ec) = if ext_lower == "jpg" || ext_lower == "jpeg" {
-                    extract_jpeg_exif(&path)
+            let (img_dims, exif_date, exif_camera, video_info) =
+                if !is_dir && is_image_ext(&ext_lower) {
+                    let dims = image::image_dimensions(&path).ok();
+                    let (ed, ec) = if ext_lower == "jpg" || ext_lower == "jpeg" {
+                        extract_jpeg_exif(&path)
+                    } else {
+                        (None, None)
+                    };
+                    (dims, ed, ec, None)
+                } else if !is_dir && media_info::is_video_ext(&ext_lower) {
+                    let vinfo =
+                        media_info::extract_video_info(&path, size, self.use_external_mediainfo);
+                    (None, None, None, vinfo)
                 } else {
-                    (None, None)
+                    (None, None, None, None)
                 };
-                (dims, ed, ec)
-            } else {
-                (None, None, None)
-            };
 
             out.push(FsEntry {
                 path: path.clone(),
@@ -1560,6 +1601,7 @@ impl ReStemApp {
                 img_dims,
                 exif_date,
                 exif_camera,
+                video_info,
             });
 
             if is_dir && self.recursive {
@@ -1614,6 +1656,7 @@ impl ReStemApp {
     }
 
     /// Подстановка умных тегов {date}, {year}, {month}, {day}, {parent}, {w}x{h}, {exif_date}, {camera}
+    /// и видео-тегов MediaInfo ({res}, {vcodec}, {acodec}, {ach}, {fps}, {duration}, {bitrate}, {hdr}, {media_date})
     fn expand_smart_tags(&self, template: &str, entry: &FsEntry) -> String {
         if !template.contains('{') {
             return template.to_string();
@@ -1627,10 +1670,49 @@ impl ReStemApp {
         let exif_d = entry.exif_date.as_deref().unwrap_or(&date_s);
         let cam_s = entry.exif_camera.as_deref().unwrap_or("");
 
-        let (w_s, h_s, wxh_s) = if let Some((w, h)) = entry.img_dims {
+        let dims = entry
+            .img_dims
+            .or_else(|| entry.video_info.as_ref().and_then(|v| v.dimensions()));
+        let (w_s, h_s, wxh_s) = if let Some((w, h)) = dims {
             (w.to_string(), h.to_string(), format!("{}x{}", w, h))
         } else {
             (String::new(), String::new(), String::new())
+        };
+
+        let (
+            res_s,
+            vcodec_s,
+            acodec_s,
+            ach_s,
+            fps_s,
+            dur_s,
+            bitrate_s,
+            hdr_s,
+            media_date_s,
+        ) = if let Some(v) = entry.video_info.as_ref() {
+            (
+                v.resolution_label().unwrap_or_default(),
+                v.video_codec.clone().unwrap_or_default(),
+                v.audio_codec.clone().unwrap_or_default(),
+                v.audio_channels_tag().unwrap_or_default(),
+                v.fps_tag().unwrap_or_default(),
+                v.duration_tag().unwrap_or_default(),
+                v.bitrate_tag().unwrap_or_default(),
+                v.hdr.clone().unwrap_or_default(),
+                v.recorded_date.as_deref().unwrap_or(&date_s).to_string(),
+            )
+        } else {
+            (
+                String::new(),
+                String::new(),
+                String::new(),
+                String::new(),
+                String::new(),
+                String::new(),
+                String::new(),
+                String::new(),
+                date_s.clone(),
+            )
         };
 
         template
@@ -1644,6 +1726,15 @@ impl ReStemApp {
             .replace("{w}x{h}", &wxh_s)
             .replace("{w}", &w_s)
             .replace("{h}", &h_s)
+            .replace("{res}", &res_s)
+            .replace("{vcodec}", &vcodec_s)
+            .replace("{acodec}", &acodec_s)
+            .replace("{ach}", &ach_s)
+            .replace("{fps}", &fps_s)
+            .replace("{duration}", &dur_s)
+            .replace("{bitrate}", &bitrate_s)
+            .replace("{hdr}", &hdr_s)
+            .replace("{media_date}", &media_date_s)
     }
 
     fn compute_new_name(
@@ -1970,11 +2061,14 @@ impl ReStemApp {
                 changed_count += 1;
             }
 
+            let is_video = !entry.is_dir && media_info::is_video_ext(&entry.ext_lower);
+
             self.preview_rows.push(PreviewRow {
                 old_path: entry.path.clone(),
                 parent_dir: entry.parent_dir.clone(),
                 rel_parent: entry.rel_parent.clone(),
                 is_dir: entry.is_dir,
+                is_video,
                 depth: entry.depth,
                 size: entry.size,
                 modified_ts: entry.modified_ts,
@@ -2417,13 +2511,15 @@ impl eframe::App for ReStemApp {
                         ui.label(lang.tr(
                             "• Рекурсивное переименование файлов и каталогов\n\
                              • Умные теги {date}, {exif_date}, {camera}, {parent}, {w}x{h}\n\
+                             • Видео-теги MediaInfo: {res}, {vcodec}, {acodec}, {ach}, {fps}, {duration}, {bitrate}, {hdr}, {media_date}\n\
                              • Посимвольная Diff-подсветка, Regex и транслит (RU ↔ LAT)\n\
-                             • Предпросмотр картинок и текста, удаление в Корзину\n\
+                             • Предпросмотр картинок, MediaInfo видео и текста, удаление в Корзину\n\
                              • Многошаговый откат (Ctrl+Z) и экспорт скрипта .bat",
                             "• Recursive file and folder batch renaming\n\
                              • Smart tags {date}, {exif_date}, {camera}, {parent}, {w}x{h}\n\
+                             • Video MediaInfo tags: {res}, {vcodec}, {acodec}, {ach}, {fps}, {duration}, {bitrate}, {hdr}, {media_date}\n\
                              • Inline character Diff, Regex & Transliteration (RU ↔ LAT)\n\
-                             • Image/text preview & safe Recycle Bin deletion\n\
+                             • Image, Video MediaInfo & text preview; safe Recycle Bin deletion\n\
                              • Multi-step Undo (Ctrl+Z) & .bat rollback export",
                         ));
 
@@ -3300,6 +3396,85 @@ impl eframe::App for ReStemApp {
                                         egui::Color32::WHITE,
                                     );
                                 }
+                                PreviewState::Video {
+                                    name,
+                                    info,
+                                    size_bytes,
+                                } => {
+                                    ui.strong(format!("🎬 {}", name));
+                                    if let Some((w, h)) = info.dimensions() {
+                                        let res_lbl = info
+                                            .resolution_label()
+                                            .map(|r| format!(" ({})", r))
+                                            .unwrap_or_default();
+                                        let hdr_lbl = info
+                                            .hdr
+                                            .as_ref()
+                                            .map(|h| format!(" • {}", h))
+                                            .unwrap_or_default();
+                                        ui.label(format!("{} × {} px{}{}", w, h, res_lbl, hdr_lbl));
+                                    }
+                                    let mut video_parts = Vec::new();
+                                    if let Some(vc) = &info.video_codec {
+                                        video_parts.push(vc.clone());
+                                    }
+                                    if let Some(fps) = info.fps_tag() {
+                                        video_parts.push(fps);
+                                    }
+                                    if !video_parts.is_empty() {
+                                        ui.label(format!(
+                                            "{}: {}",
+                                            lang.tr("Видео", "Video"),
+                                            video_parts.join(" • ")
+                                        ));
+                                    }
+                                    let mut audio_parts = Vec::new();
+                                    if let Some(ac) = &info.audio_codec {
+                                        audio_parts.push(ac.clone());
+                                    }
+                                    if let Some(ch) = info.audio_channels_tag() {
+                                        audio_parts.push(ch);
+                                    }
+                                    if !audio_parts.is_empty() {
+                                        ui.label(format!(
+                                            "{}: {}",
+                                            lang.tr("Аудио", "Audio"),
+                                            audio_parts.join(" • ")
+                                        ));
+                                    }
+                                    let mut meta_parts = Vec::new();
+                                    if let Some(dur) = info.duration_display() {
+                                        meta_parts.push(format!("⏱ {}", dur));
+                                    }
+                                    if let Some(br) = info.bitrate_tag() {
+                                        meta_parts.push(br);
+                                    } else if *size_bytes > 0 {
+                                        meta_parts.push(Self::format_size(*size_bytes, false));
+                                    }
+                                    if !meta_parts.is_empty() {
+                                        ui.label(meta_parts.join("  •  "));
+                                    }
+                                    if let Some(rd) = &info.recorded_date {
+                                        ui.weak(format!(
+                                            "📅 {}: {}",
+                                            lang.tr("Дата записи", "Recorded"),
+                                            rd
+                                        ));
+                                    }
+                                    let cont = info.container.as_deref().unwrap_or("Video");
+                                    ui.weak(format!(
+                                        "{}: {} ({})",
+                                        lang.tr("Контейнер", "Container"),
+                                        cont,
+                                        info.source.label()
+                                    ));
+                                    if !info.has_any_metadata() {
+                                        ui.weak(lang.tr(
+                                            "Метаданные не найдены. Для нестандартных форматов установите MediaInfo CLI или ffprobe в PATH.",
+                                            "No metadata found. For uncommon formats, install MediaInfo CLI or ffprobe in PATH.",
+                                        ));
+                                    }
+                                }
                                 PreviewState::Text {
                                     name,
                                     content,
@@ -3407,6 +3582,27 @@ impl eframe::App for ReStemApp {
                                 .clicked()
                             {
                                 self.suffix = "_{w}x{h}".to_string();
+                                needs_recalc = true;
+                            }
+                            if ui
+                                .button(lang.tr(
+                                    "• Видео: _{res}_{vcodec}_{fps}",
+                                    "• Video: _{res}_{vcodec}_{fps}",
+                                ))
+                                .clicked()
+                            {
+                                self.suffix = "_{res}_{vcodec}_{fps}".to_string();
+                                needs_recalc = true;
+                            }
+                            if ui
+                                .button(lang.tr(
+                                    "• Видео: {media_date}_ + _{res}_{acodec}",
+                                    "• Video: {media_date}_ + _{res}_{acodec}",
+                                ))
+                                .clicked()
+                            {
+                                self.prefix = "{media_date}_".to_string();
+                                self.suffix = "_{res}_{acodec}".to_string();
                                 needs_recalc = true;
                             }
 
@@ -3844,14 +4040,116 @@ impl eframe::App for ReStemApp {
                             ));
                             ui.horizontal_wrapped(|ui| {
                                 for (tag, tip) in [
-                                    ("{date}_", "Дата изменения (ГГГГ-ММ-ДД)"),
-                                    ("{exif_date}_", "Дата съёмки фото из EXIF"),
-                                    ("{camera}_", "Модель камеры из EXIF"),
-                                    ("{parent}_", "Имя родительской папки"),
-                                    ("{w}x{h}_", "Разрешение изображения (ШxВ)"),
+                                    (
+                                        "{date}_",
+                                        lang.tr(
+                                            "Дата изменения (ГГГГ-ММ-ДД)",
+                                            "File modified date (YYYY-MM-DD)",
+                                        ),
+                                    ),
+                                    (
+                                        "{exif_date}_",
+                                        lang.tr(
+                                            "Дата съёмки фото из EXIF",
+                                            "Photo capture date from EXIF",
+                                        ),
+                                    ),
+                                    (
+                                        "{camera}_",
+                                        lang.tr("Модель камеры из EXIF", "Camera model from EXIF"),
+                                    ),
+                                    (
+                                        "{parent}_",
+                                        lang.tr("Имя родительской папки", "Parent folder name"),
+                                    ),
+                                    (
+                                        "{w}x{h}_",
+                                        lang.tr(
+                                            "Разрешение фото/видео (ШxВ)",
+                                            "Photo/Video dimensions (WxH)",
+                                        ),
+                                    ),
                                 ] {
                                     if ui.small_button(tag).on_hover_text(tip).clicked() {
                                         self.prefix.push_str(tag);
+                                        needs_recalc = true;
+                                    }
+                                }
+                            });
+
+                            ui.add_space(4.0);
+                            ui.weak(lang.tr(
+                                "🎬 Видео-теги MediaInfo (в Суффикс):",
+                                "🎬 Video MediaInfo tags (to Suffix):",
+                            ));
+                            ui.horizontal_wrapped(|ui| {
+                                for (tag, tip) in [
+                                    (
+                                        "_{res}",
+                                        lang.tr(
+                                            "Качество видео: 1080p, 2160p, 720p",
+                                            "Video quality label: 1080p, 2160p, 720p",
+                                        ),
+                                    ),
+                                    (
+                                        "_{vcodec}",
+                                        lang.tr(
+                                            "Видеокодек: H264, HEVC, AV1, VP9",
+                                            "Video codec: H264, HEVC, AV1, VP9",
+                                        ),
+                                    ),
+                                    (
+                                        "_{fps}",
+                                        lang.tr(
+                                            "Частота кадров: 24fps, 60fps",
+                                            "Frame rate: 24fps, 60fps",
+                                        ),
+                                    ),
+                                    (
+                                        "_{acodec}",
+                                        lang.tr(
+                                            "Аудиокодек: AAC, AC3, Opus, DTS",
+                                            "Audio codec: AAC, AC3, Opus, DTS",
+                                        ),
+                                    ),
+                                    (
+                                        "_{ach}",
+                                        lang.tr(
+                                            "Каналы аудио: 2.0, 5.1, 7.1",
+                                            "Audio channels: 2.0, 5.1, 7.1",
+                                        ),
+                                    ),
+                                    (
+                                        "_{duration}",
+                                        lang.tr(
+                                            "Длительность: 04m35s, 01h20m10s",
+                                            "Duration: 04m35s, 01h20m10s",
+                                        ),
+                                    ),
+                                    (
+                                        "_{bitrate}",
+                                        lang.tr(
+                                            "Битрейт: 12Mbps, 850kbps",
+                                            "Bitrate: 12Mbps, 850kbps",
+                                        ),
+                                    ),
+                                    (
+                                        "_{hdr}",
+                                        lang.tr(
+                                            "Формат HDR: HDR10, HLG, DV",
+                                            "HDR format: HDR10, HLG, DV",
+                                        ),
+                                    ),
+                                    (
+                                        "_{media_date}",
+                                        lang.tr(
+                                            "Дата записи из метаданных видео (ГГГГ-ММ-ДД)",
+                                            "Video recorded date from metadata (YYYY-MM-DD)",
+                                        ),
+                                    ),
+                                ] {
+                                    if ui.small_button(tag).on_hover_text(tip).clicked() {
+                                        self.suffix.push_str(tag);
                                         needs_recalc = true;
                                     }
                                 }
@@ -4194,6 +4492,7 @@ impl eframe::App for ReStemApp {
             let status_changed = lang.tr("Изменится", "Preview");
             let status_skipped = lang.tr("Пропущен", "Skipped");
             let label_folder = lang.tr("📁 Папка", "📁 Folder");
+            let label_video = lang.tr("🎬 Видео", "🎬 Video");
             let label_file = lang.tr("📄 Файл", "📄 File");
 
             let current_selected = self.selected_path.clone();
@@ -4266,6 +4565,8 @@ impl eframe::App for ReStemApp {
                             row.col(|ui| {
                                 let kind_str = if item.is_dir {
                                     label_folder
+                                } else if item.is_video {
+                                    label_video
                                 } else {
                                     label_file
                                 };
@@ -4278,6 +4579,13 @@ impl eframe::App for ReStemApp {
                                         egui::Color32::from_rgb(195, 115, 10)
                                     };
                                     ui.colored_label(folder_col, kind_str);
+                                } else if item.is_video {
+                                    let video_col = if is_dark {
+                                        egui::Color32::from_rgb(95, 195, 255)
+                                    } else {
+                                        egui::Color32::from_rgb(15, 105, 190)
+                                    };
+                                    ui.colored_label(video_col, kind_str);
                                 } else {
                                     ui.label(kind_str);
                                 }
@@ -4413,5 +4721,78 @@ impl eframe::App for ReStemApp {
                 self.recalculate_preview();
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_video_smart_tags_expansion_and_rename() {
+        let mut app = ReStemApp::default();
+        app.prefix = "{media_date}_".to_string();
+        app.suffix = "_{res}_{vcodec}_{fps}_{acodec}_{ach}_{duration}_{bitrate}_{hdr}".to_string();
+
+        let video_entry = FsEntry {
+            path: PathBuf::from("Movie.mkv"),
+            parent_dir: PathBuf::from("."),
+            parent_name: "Movies".to_string(),
+            rel_parent: ".".to_string(),
+            name: "Movie.mkv".to_string(),
+            ext_lower: "mkv".to_string(),
+            is_dir: false,
+            is_hidden: false,
+            depth: 0,
+            size: 1_500_000_000,
+            modified_ts: 1_700_000_000,
+            img_dims: None,
+            exif_date: None,
+            exif_camera: None,
+            video_info: Some(media_info::VideoMediaInfo {
+                width: Some(3840),
+                height: Some(2160),
+                duration_secs: Some(3725.0),
+                fps: Some(23.976),
+                video_codec: Some("HEVC".to_string()),
+                audio_codec: Some("AC3".to_string()),
+                audio_channels: Some(6),
+                bitrate_bps: Some(15_400_000),
+                recorded_date: Some("2026-11-23".to_string()),
+                hdr: Some("HDR10".to_string()),
+                container: Some("MKV".to_string()),
+                source: media_info::MediaInfoSource::BuiltIn,
+            }),
+        };
+
+        assert_eq!(
+            app.compute_new_name(&video_entry, 0, None),
+            "2026-11-23_Movie_2160p_HEVC_23.98fps_AC3_5.1_01h02m05s_15Mbps_HDR10.mkv"
+        );
+        assert_eq!(app.expand_smart_tags("{w}x{h}", &video_entry), "3840x2160");
+
+        let plain_entry = FsEntry {
+            path: PathBuf::from("notes.txt"),
+            parent_dir: PathBuf::from("."),
+            parent_name: "Docs".to_string(),
+            rel_parent: ".".to_string(),
+            name: "notes.txt".to_string(),
+            ext_lower: "txt".to_string(),
+            is_dir: false,
+            is_hidden: false,
+            depth: 0,
+            size: 120,
+            modified_ts: 1_795_392_000, // 2026-11-23 UTC
+            img_dims: None,
+            exif_date: None,
+            exif_camera: None,
+            video_info: None,
+        };
+
+        assert_eq!(
+            app.expand_smart_tags("{res}|{vcodec}|{acodec}|{fps}|{duration}|{hdr}", &plain_entry),
+            "|||||"
+        );
+        assert_eq!(app.expand_smart_tags("{media_date}", &plain_entry), "2026-11-23");
     }
 }

@@ -1,5 +1,30 @@
 # История изменений / Changelog — ReStem
 
+## [v1.4.0] — 2026-11-23
+### 🇷🇺 Что нового
+* **Поддержка MediaInfo для переименования видео:**
+  * Добавлены новые умные теги для переименования видеофайлов: `{res}` (`2160p`, `1080p`, `720p`, `480p` и др.), `{vcodec}` (`H264`, `HEVC`, `AV1`, `VP9`, `ProRes` и др.), `{acodec}` (`AAC`, `AC3`, `EAC3`, `Opus`, `DTS`, `FLAC` и др.), `{ach}` (`1.0`, `2.0`, `5.1`, `7.1`), `{fps}` (`23.98fps`, `24fps`, `60fps`), `{duration}` (`04m35s`, `01h02m05s`), `{bitrate}` (`15Mbps`, `850kbps`), `{hdr}` (`HDR10`, `HLG`, `DV`) и `{media_date}` (дата записи из метаданных контейнера).
+  * Существующие теги `{w}x{h}`, `{w}`, `{h}` теперь также автоматически работают для видеофайлов.
+* **Встроенный парсер контейнеров + внешний fallback:**
+  * Нативное чтение заголовков на чистом Rust (без внешних DLL и зависимостей) для `MP4`, `M4V`, `MOV`, `3GP`, `MKV`, `WebM`, `AVI` и `FLV`.
+  * При наличии в `PATH` системных утилит `MediaInfo CLI` или `ffprobe` они автоматически используются как запасной источник для редких форматов (`TS`, `M2TS`, `WMV`, `MPG`, `VOB`, `OGV`) или неполных заголовков.
+* **Предпросмотр MediaInfo и быстрые пресеты:**
+  * В карточке **«👁 Предпросмотр объекта»** при выборе видео отображаются разрешение, класс качества, HDR, видео-/аудиокодеки, каналы звука, длительность, битрейт, дата записи и источник метаданных.
+  * В таблице добавлена визуальная пометка `🎬 Видео` в столбце **«Тип»**, а на панели правил и пресетов — быстрая вставка видео-тегов в один клик и готовые пресеты для переименования фильмов и роликов.
+
+### 🇬🇧 What's New
+* **Video MediaInfo Support for Batch Renaming:**
+  * Added new Smart Tags for video files: `{res}` (`2160p`, `1080p`, `720p`, `480p`, etc.), `{vcodec}` (`H264`, `HEVC`, `AV1`, `VP9`, `ProRes`, etc.), `{acodec}` (`AAC`, `AC3`, `EAC3`, `Opus`, `DTS`, `FLAC`, etc.), `{ach}` (`1.0`, `2.0`, `5.1`, `7.1`), `{fps}` (`23.98fps`, `24fps`, `60fps`), `{duration}` (`04m35s`, `01h02m05s`), `{bitrate}` (`15Mbps`, `850kbps`), `{hdr}` (`HDR10`, `HLG`, `DV`), and `{media_date}` (recorded date from container metadata).
+  * Existing `{w}x{h}`, `{w}`, `{h}` dimension tags now work automatically for video files as well.
+* **Built-In Container Parser + Optional External Fallback:**
+  * Zero-dependency pure-Rust header parsing for `MP4`, `M4V`, `MOV`, `3GP`, `MKV`, `WebM`, `AVI`, and `FLV`.
+  * Automatically falls back to `MediaInfo CLI` or `ffprobe` (if available in `PATH`) for uncommon containers (`TS`, `M2TS`, `WMV`, `MPG`, `VOB`, `OGV`) or incomplete headers.
+* **Video MediaInfo Preview & Quick Presets:**
+  * Selecting a video file in **👁 Item Preview** displays resolution, quality tier, HDR status, video/audio codecs, channels, duration, bitrate, recorded date, and parser source.
+  * Added a distinct `🎬 Video` type badge in the preview table, one-click video tag buttons in Section 3, and dedicated quick presets for batch renaming videos.
+
+---
+
 ## [v1.3.0] — 2026-11-14
 ### 🇷🇺 Что нового
 * **Умные теги (Smart Tags) и чтение EXIF:** динамическая подстановка переменных `{date}`, `{year}`, `{month}`, `{day}`, `{exif_date}` (дата съёмки из EXIF), `{camera}` (модель камеры/смартфона из EXIF), `{parent}` (имя родительской папки) и `{w}x{h}` (разрешение изображения в пикселях).
