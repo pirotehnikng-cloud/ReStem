@@ -78,7 +78,7 @@ impl VideoMediaInfo {
         if !fps.is_finite() || !(1.0..=240.0).contains(&fps) {
             return None;
         }
-        if (fps - fps.round()).abs() < 0.05 {
+        if (fps - fps.round()).abs() < 0.015 {
             Some(format!("{}fps", fps.round() as u32))
         } else {
             let mut formatted = format!("{:.2}", fps);
@@ -1785,26 +1785,51 @@ fn parse_spaced_digits_u32(val: &str) -> Option<u32> {
 }
 
 fn parse_mediainfo_duration(val: &str) -> Option<f64> {
+    let cleaned: String = val.chars().filter(|c| !c.is_whitespace()).collect();
+    let lower = cleaned.to_lowercase();
+    let bytes = lower.as_bytes();
+    let mut i = 0;
     let mut total: f64 = 0.0;
     let mut matched = false;
-    for tok in val.split_whitespace() {
-        if let Some(n) = tok.strip_suffix("h").and_then(|s| s.parse::<f64>().ok()) {
-            total += n * 3600.0;
-            matched = true;
-        } else if let Some(n) = tok.strip_suffix("mn").and_then(|s| s.parse::<f64>().ok()) {
-            total += n * 60.0;
-            matched = true;
-        } else if let Some(n) = tok.strip_suffix("min").and_then(|s| s.parse::<f64>().ok()) {
-            total += n * 60.0;
-            matched = true;
-        } else if let Some(n) = tok.strip_suffix("ms").and_then(|s| s.parse::<f64>().ok()) {
-            total += n / 1000.0;
-            matched = true;
-        } else if let Some(n) = tok.strip_suffix('s').and_then(|s| s.parse::<f64>().ok()) {
-            total += n;
-            matched = true;
+
+    while i < bytes.len() {
+        let num_start = i;
+        while i < bytes.len() && (bytes[i].is_ascii_digit() || bytes[i] == b'.') {
+            i += 1;
+        }
+        if i == num_start {
+            i += 1;
+            continue;
+        }
+        let Ok(num) = lower[num_start..i].parse::<f64>() else {
+            continue;
+        };
+        let unit_start = i;
+        while i < bytes.len() && bytes[i].is_ascii_alphabetic() {
+            i += 1;
+        }
+        let unit = &lower[unit_start..i];
+        match unit {
+            "h" | "hr" | "hrs" => {
+                total += num * 3600.0;
+                matched = true;
+            }
+            "mn" | "min" | "m" => {
+                total += num * 60.0;
+                matched = true;
+            }
+            "s" | "sec" => {
+                total += num;
+                matched = true;
+            }
+            "ms" => {
+                total += num / 1000.0;
+                matched = true;
+            }
+            _ => {}
         }
     }
+
     if matched && total > 0.0 {
         Some(total)
     } else {
