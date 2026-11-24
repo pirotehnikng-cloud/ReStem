@@ -1,5 +1,53 @@
 # История изменений / Changelog — ReStem
 
+## [v1.5.0] — 2026-11-24
+### 🇷🇺 Что нового
+* **Аудио-теги (ID3v2 / ID3v1 / FLAC / OGG / Opus / M4A / WAV) и обложки треков:**
+  * Нативные парсеры на чистом Rust без внешних библиотек: добавлены теги `{artist}`, `{album}`, `{title}`, `{track}`, `{audio_year}`, `{genre}`, `{audio_bitrate}`, `{sample_rate}`, а также `{duration}` для аудиофайлов.
+  * Встроенный предпросмотр извлекает и отображает обложку альбома (`APIC` / `PICTURE` / `covr`), исполнителя, альбом, трек, год, жанр, длительность и битрейт.
+* **Расширенный EXIF для фото (JPEG, HEIC/HEIF, WebP, PNG, TIFF/RAW):**
+  * Поддержка чтения EXIF-заголовков из **HEIC**, **WebP** (`EXIF`), **PNG** (`eXIf`) и **RAW** (`CR2`, `NEF`, `ARW`, `DNG`, `ORF`, `RW2`, `TIFF`).
+  * Новые теги: `{exif_time}` (`ЧЧ-ММ-СС`), `{lens}` (объектив), `{iso}`, `{aperture}` (`f2.8`), `{shutter}` (`1-500s`).
+* **Парные файлы (Sidecars) и предпросмотр кадра видео:**
+  * Опция **«📎 Парные файлы»** автоматически синхронизирует переименование и перемещение субтитров (`.srt`, `.ass`, `.ssa`, `.vtt`, `.sub`, `.idx`) и sidecar-файлов (`.xmp`, `.nfo`, `.thm`, `.aae`) вместе с основным видео/фото.
+  * При наличии `ffmpeg` в `PATH` в карточке предпросмотра видео асинхронно загружается миниатюра кадра.
+* **Контроль конфликтов, ручная правка строк и безопасный обмен имён:**
+  * Подсветка дубликатов, недопустимых символов, зарезервированных имён Windows (`CON`, `NUL`, `COM1`…) и длинных путей (`> 260`) прямо в таблице, фильтр **«⚠ Конфликты / Ошибки»** и опция автосуффикса (`_1`, `_2`).
+  * Двухфазное безопасное переименование (корректно обрабатывает циклический обмен `A ↔ B` и смену регистра в Windows).
+  * Кнопка `✏` прямо в строке таблицы позволяет вручную отредактировать новое имя любого объекта.
+* **Раскладка по подпапкам (Organize), дубликаты и теги хешей:**
+  * Перенос файлов по шаблону подпапок (например, `{year}/{month}`, `{exif_date}`, `{media_date}/{res}`, `{artist}/{album}`) с полным откатом `Ctrl+Z` (включая удаление созданных пустых папок).
+  * Модальное окно **«🧬 Дубликаты»**: быстрый 3-этапный поиск точных копий (размер → частичный SHA-256 → полный SHA-256) с выделением копий и удалением в Корзину.
+  * Новые теги контрольных сумм и размера: `{size}`, `{crc32}`, `{sha256_8}` (вычисляются лениво).
+* **Производительность, Pipeline правил, пресеты JSON, CLI и проверка обновлений:**
+  * Фоновое (асинхронное) сканирование каталогов с индикатором прогресса и кнопкой **«✖ Отмена»**.
+  * Несколько цепочек **«Поиск и замена»** (`➕ Шаг`) и настраиваемый порядок этапов переименования (**«⚙ Порядок этапов (Pipeline)»**).
+  * Сохранение полных пресетов в `restem_presets.json` с кнопками **«📤 Экспорт .json» / «📥 Импорт .json»** и автомиграцией старых пресетов.
+  * Полноценный **CLI-режим** для `.bat`-скриптов (`restem <DIR> --preset <NAME> [--recursive] [--dry-run | --apply]`, `--list-presets`) и ненавязчивая проверка новых релизов GitHub.
+
+### 🇬🇧 What's New
+* **Pure-Rust Audio Tags (ID3v2 / ID3v1 / FLAC / OGG / Opus / M4A / WAV) & Cover Art:**
+  * Added `{artist}`, `{album}`, `{title}`, `{track}`, `{audio_year}`, `{genre}`, `{audio_bitrate}`, `{sample_rate}`, and `{duration}` support for audio files.
+  * Item Preview renders embedded album cover art (`APIC` / `PICTURE` / `covr`) along with full track metadata.
+* **Extended Photo EXIF (JPEG, HEIC/HEIF, WebP, PNG, TIFF/RAW):**
+  * Added EXIF parsing for **HEIC**, **WebP** (`EXIF`), **PNG** (`eXIf`), and **RAW** (`CR2`, `NEF`, `ARW`, `DNG`, `ORF`, `RW2`, `TIFF`), plus `{exif_time}`, `{lens}`, `{iso}`, `{aperture}`, and `{shutter}` tags.
+* **Sidecar Sync & Async Video Frame Thumbnails:**
+  * **📎 Sync sidecar files** keeps `.srt`, `.ass`, `.vtt`, `.xmp`, `.nfo`, etc. aligned with their primary video/photo filename and destination folder.
+  * Extracts a video frame thumbnail asynchronously in Item Preview when `ffmpeg` is available on `PATH`.
+* **Collision Detection, Windows Name Validation, Inline Row Edit & 2-Phase Rename:**
+  * Highlights duplicate targets, reserved Windows names, invalid chars, and paths `> 260` characters before applying, with optional `_1`/`_2` auto-suffix resolution and 2-phase safe swaps (`A ↔ B`).
+  * Added inline `✏` editing in the preview table to fine-tune individual filenames manually.
+* **Subfolder Organize, Duplicate File Finder & Hash Tags:**
+  * Move files into dynamic subfolder templates (e.g. `{year}/{month}`, `{media_date}/{res}`, `{artist}/{album}`) with full `Ctrl+Z` undo and cleanup of newly created empty directories.
+  * **🧬 Duplicate Finder** runs a fast 3-stage scan (size → partial SHA-256 → full SHA-256) and lets you move selected copies to Recycle Bin.
+  * Added lazy `{size}`, `{crc32}`, and `{sha256_8}` tags.
+* **Async Scanner, Custom Rule Pipeline, JSON Presets, CLI Mode & Update Check:**
+  * Non-blocking directory scanner with live progress indicator and Cancel button.
+  * Chained **Find & Replace** steps (`➕ Step`) and reorderable **Rule Pipeline**.
+  * Full JSON presets (`restem_presets.json`) with **Export/Import `.json`**, headless **CLI mode** (`--preset`, `--preset-file`, `--dry-run`, `--apply`, `--list-presets`), and non-blocking GitHub release update check.
+
+---
+
 ## [v1.4.0] — 2026-11-23
 ### 🇷🇺 Что нового
 * **Поддержка MediaInfo для переименования видео:**

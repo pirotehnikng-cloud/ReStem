@@ -1,19 +1,35 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod audio_info;
+mod cli;
+mod hash_utils;
 mod media_info;
+mod photo_meta;
+mod rename_engine;
+mod scanner;
+mod updater;
+
+pub(crate) use rename_engine::decompose_timestamp;
 
 use eframe::egui;
 use egui_extras::{Column, TableBuilder};
-use regex::RegexBuilder;
-use std::cmp::Ordering;
-use std::collections::HashSet;
+use hash_utils::{DupScanMsg, DuplicateGroup};
+use rename_engine::{
+    build_rollback_bat, compute_preview, default_rule_order, execute_rename_batch,
+    execute_undo_batch, format_timestamp, load_presets_json, save_presets_json, CaseMode, ExtMode,
+    FsEntry, FullPreset, HashCache, Lang, NumMode, PreviewRow, RenameConfig, ReplaceStep,
+    RowIssue, RuleStage, SizeFilterMode, SortField, StatusFilter, TranslitMode, UndoBatch,
+};
+use scanner::{ScanJob, ScanMsg};
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::Arc;
-use std::time::UNIX_EPOCH;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{mpsc, Arc};
+use updater::{UpdateCheckState, UpdateInfo};
 
 const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 const APP_LICENSE: &str = match option_env!("CARGO_PKG_LICENSE") {
@@ -22,26 +38,24 @@ const APP_LICENSE: &str = match option_env!("CARGO_PKG_LICENSE") {
 };
 const GITHUB_REPO_URL: &str = match option_env!("CARGO_PKG_REPOSITORY") {
     Some(url) if !url.is_empty() => url,
-    _ => "https://github.com/",
+    _ => "https://github.com/pirotehnikng-cloud/ReStem",
 };
 
 fn main() -> eframe::Result<()> {
-    let icon = build_app_icon();
-    let cli_dir = env::args().nth(1).map(PathBuf::from).and_then(|p| {
-        if p.is_dir() {
-            Some(p)
-        } else {
-            p.parent().map(|par| par.to_path_buf())
-        }
-    });
+    let args: Vec<String> = env::args().collect();
+    let cli_dir = match cli::handle_cli_args(&args, APP_VERSION) {
+        cli::CliAction::ExitCode(code) => std::process::exit(code),
+        cli::CliAction::LaunchGui(dir) => dir,
+    };
 
+    let icon = build_app_icon();
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title(format!(
                 "ReStem v{} — Пакетное переименование файлов и папок",
                 APP_VERSION
             ))
-            .with_inner_size([1380.0, 840.0])
+            .with_inner_size([1420.0, 860.0])
             .with_min_inner_size([960.0, 600.0])
             .with_drag_and_drop(true)
             .with_icon(Arc::new(icon)),
@@ -57,8 +71,11 @@ fn main() -> eframe::Result<()> {
             app.load_settings();
             apply_theme_and_style(&cc.egui_ctx, app.dark_mode);
             cc.egui_ctx.set_pixels_per_point(app.ui_scale);
+            if app.check_updates {
+                app.trigger_update_check(&cc.egui_ctx);
+            }
             if let Some(dir) = cli_dir {
-                app.open_new_directory(dir);
+                app.open_new_directory(dir, &cc.egui_ctx);
             }
             Ok(Box::new(app))
         }),
@@ -109,7 +126,6 @@ fn setup_custom_fonts(ctx: &egui::Context) {
     ctx.set_fonts(fonts);
 }
 
-/// Настройка крупной типографики и высококонтрастной Светлой / Тёмной темы
 fn apply_theme_and_style(ctx: &egui::Context, dark_mode: bool) {
     let mut style = (*ctx.style()).clone();
     style.text_styles = [
@@ -246,364 +262,6 @@ fn build_app_icon() -> egui::IconData {
     }
 }
 
-/// Умная («натуральная») сортировка строк с учётом чисел (file2 перед file10)
-fn natural_cmp(a: &str, b: &str) -> Ordering {
-    let mut ia = a.chars().peekable();
-    let mut ib = b.chars().peekable();
-
-    while let (Some(&ca), Some(&cb)) = (ia.peek(), ib.peek()) {
-        if ca.is_ascii_digit() && cb.is_ascii_digit() {
-            let mut na = String::new();
-            while let Some(&c) = ia.peek() {
-                if c.is_ascii_digit() {
-                    na.push(c);
-                    ia.next();
-                } else {
-                    break;
-                }
-            }
-            let mut nb = String::new();
-            while let Some(&c) = ib.peek() {
-                if c.is_ascii_digit() {
-                    nb.push(c);
-                    ib.next();
-                } else {
-                    break;
-                }
-            }
-            let va = na.trim_start_matches('0');
-            let vb = nb.trim_start_matches('0');
-            let ord = va
-                .len()
-                .cmp(&vb.len())
-                .then_with(|| va.cmp(vb))
-                .then_with(|| na.len().cmp(&nb.len()));
-            if ord != Ordering::Equal {
-                return ord;
-            }
-        } else {
-            let ua = ca.to_lowercase().next().unwrap_or(ca);
-            let ub = cb.to_lowercase().next().unwrap_or(cb);
-            let ord = ua.cmp(&ub);
-            if ord != Ordering::Equal {
-                return ord;
-            }
-            ia.next();
-            ib.next();
-        }
-    }
-    ia.count().cmp(&ib.count())
-}
-
-/// Разбор UNIX-времени на (год, месяц, день, часы, минуты)
-pub(crate) fn decompose_timestamp(secs: u64) -> (i64, u32, u32, u64, u64) {
-    if secs == 0 {
-        return (1970, 1, 1, 0, 0);
-    }
-    let days = (secs / 86400) as i64;
-    let rem = secs % 86400;
-    let hours = rem / 3600;
-    let mins = (rem % 3600) / 60;
-
-    let z = days + 719468;
-    let era = if z >= 0 { z } else { z - 146096 } / 146097;
-    let doe = (z - era * 146097) as u32;
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
-    let y = yoe as i64 + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    let year = if m <= 2 { y + 1 } else { y };
-
-    (year, m, d, hours, mins)
-}
-
-fn format_timestamp(secs: u64) -> String {
-    if secs == 0 {
-        return "—".to_string();
-    }
-    let (year, m, d, hours, mins) = decompose_timestamp(secs);
-    format!("{:04}-{:02}-{:02} {:02}:{:02}", year, m, d, hours, mins)
-}
-
-/// Прямая транслитерация кириллицы (RU -> LAT)
-fn transliterate_ru_to_lat(input: &str) -> String {
-    let mut out = String::with_capacity(input.len() * 2);
-    for ch in input.chars() {
-        let replacement = match ch {
-            'а' => "a",    'А' => "A",
-            'б' => "b",    'Б' => "B",
-            'в' => "v",    'В' => "V",
-            'г' => "g",    'Г' => "G",
-            'д' => "d",    'Д' => "D",
-            'е' => "e",    'Е' => "E",
-            'ё' => "yo",   'Ё' => "Yo",
-            'ж' => "zh",   'Ж' => "Zh",
-            'з' => "z",    'З' => "Z",
-            'и' => "i",    'И' => "I",
-            'й' => "y",    'Й' => "Y",
-            'к' => "k",    'К' => "K",
-            'л' => "l",    'Л' => "L",
-            'м' => "m",    'М' => "M",
-            'н' => "n",    'Н' => "N",
-            'о' => "o",    'О' => "O",
-            'п' => "p",    'П' => "P",
-            'р' => "r",    'Р' => "R",
-            'с' => "s",    'С' => "S",
-            'т' => "t",    'Т' => "T",
-            'у' => "u",    'У' => "U",
-            'ф' => "f",    'Ф' => "F",
-            'х' => "kh",   'Х' => "Kh",
-            'ц' => "ts",   'Ц' => "Ts",
-            'ч' => "ch",   'Ч' => "Ch",
-            'ш' => "sh",   'Ш' => "Sh",
-            'щ' => "shch", 'Щ' => "Shch",
-            'ъ' | 'Ъ' | 'ь' | 'Ь' => "",
-            'ы' => "y",    'Ы' => "Y",
-            'э' => "e",    'Э' => "E",
-            'ю' => "yu",   'Ю' => "Yu",
-            'я' => "ya",   'Я' => "Ya",
-            _ => {
-                out.push(ch);
-                continue;
-            }
-        };
-        out.push_str(replacement);
-    }
-    out
-}
-
-/// Обратная транслитерация латиницы в кириллицу (LAT -> RU)
-fn transliterate_lat_to_ru(input: &str) -> String {
-    let mut s = input.to_string();
-    let multi_rules = [
-        ("shch", "щ"), ("Shch", "Щ"), ("SHCH", "Щ"),
-        ("yo", "ё"),   ("Yo", "Ё"),   ("YO", "Ё"),
-        ("zh", "ж"),   ("Zh", "Ж"),   ("ZH", "Ж"),
-        ("kh", "х"),   ("Kh", "Х"),   ("KH", "Х"),
-        ("ts", "ц"),   ("Ts", "Ц"),   ("TS", "Ц"),
-        ("ch", "ч"),   ("Ch", "Ч"),   ("CH", "Ч"),
-        ("sh", "ш"),   ("Sh", "Ш"),   ("SH", "Ш"),
-        ("yu", "ю"),   ("Yu", "Ю"),   ("YU", "Ю"),
-        ("ya", "я"),   ("Ya", "Я"),   ("YA", "Я"),
-    ];
-    for (pat, rep) in multi_rules {
-        s = s.replace(pat, rep);
-    }
-
-    let mut out = String::with_capacity(s.len() * 2);
-    for ch in s.chars() {
-        let rep = match ch {
-            'a' => 'а', 'A' => 'А',
-            'b' => 'б', 'B' => 'Б',
-            'v' | 'w' => 'в', 'V' | 'W' => 'В',
-            'g' => 'г', 'G' => 'Г',
-            'd' => 'д', 'D' => 'Д',
-            'e' => 'е', 'E' => 'Е',
-            'z' => 'з', 'Z' => 'З',
-            'i' => 'и', 'I' => 'И',
-            'y' | 'j' => 'й', 'Y' | 'J' => 'Й',
-            'k' | 'q' => 'к', 'K' | 'Q' => 'К',
-            'l' => 'л', 'L' => 'Л',
-            'm' => 'м', 'M' => 'М',
-            'n' => 'н', 'N' => 'Н',
-            'o' => 'о', 'O' => 'О',
-            'p' => 'п', 'P' => 'П',
-            'r' => 'р', 'R' => 'Р',
-            's' => 'с', 'S' => 'С',
-            't' => 'т', 'T' => 'Т',
-            'u' => 'у', 'U' => 'У',
-            'f' => 'ф', 'F' => 'Ф',
-            'h' => 'х', 'H' => 'Х',
-            'c' => 'ц', 'C' => 'Ц',
-            _ => ch,
-        };
-        out.push(rep);
-    }
-    out
-}
-
-/// Санация («чистка») основы имени файла
-fn sanitize_stem(input: &str) -> String {
-    let mut cleaned = String::with_capacity(input.len());
-    let mut prev_space = false;
-
-    for ch in input.chars() {
-        if matches!(ch, '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*') {
-            continue;
-        }
-        if ch.is_whitespace() {
-            if !prev_space {
-                cleaned.push(' ');
-                prev_space = true;
-            }
-        } else {
-            cleaned.push(ch);
-            prev_space = false;
-        }
-    }
-    cleaned.trim().trim_end_matches('.').trim().to_string()
-}
-
-/// Встроенный быстрый парсер EXIF из заголовка JPEG (извлекает Дату съёмки и Модель камеры)
-fn extract_jpeg_exif(path: &Path) -> (Option<String>, Option<String>) {
-    let Ok(mut file) = fs::File::open(path) else {
-        return (None, None);
-    };
-    let mut buf = vec![0u8; 65536];
-    let Ok(n) = file.read(&mut buf) else {
-        return (None, None);
-    };
-    buf.truncate(n);
-
-    if buf.len() < 4 || buf[0] != 0xFF || buf[1] != 0xD8 {
-        return (None, None);
-    }
-
-    let mut pos = 2;
-    while pos + 4 <= buf.len() {
-        if buf[pos] != 0xFF {
-            break;
-        }
-        let marker = buf[pos + 1];
-        if marker == 0xDA || marker == 0xD9 {
-            break;
-        }
-        let seg_len = u16::from_be_bytes([buf[pos + 2], buf[pos + 3]]) as usize;
-        if seg_len < 2 || pos + 2 + seg_len > buf.len() {
-            break;
-        }
-        if marker == 0xE1 && seg_len >= 14 {
-            let seg = &buf[pos + 4..pos + 2 + seg_len];
-            if seg.starts_with(b"Exif\0\0") {
-                return parse_tiff_exif(&seg[6..]);
-            }
-        }
-        pos += 2 + seg_len;
-    }
-    (None, None)
-}
-
-fn parse_tiff_exif(tiff: &[u8]) -> (Option<String>, Option<String>) {
-    if tiff.len() < 8 {
-        return (None, None);
-    }
-    let le = match &tiff[0..2] {
-        b"II" => true,
-        b"MM" => false,
-        _ => return (None, None),
-    };
-    let r16 = |offset: usize| -> Option<u16> {
-        let b = tiff.get(offset..offset + 2)?;
-        Some(if le {
-            u16::from_le_bytes([b[0], b[1]])
-        } else {
-            u16::from_be_bytes([b[0], b[1]])
-        })
-    };
-    let r32 = |offset: usize| -> Option<u32> {
-        let b = tiff.get(offset..offset + 4)?;
-        Some(if le {
-            u32::from_le_bytes([b[0], b[1], b[2], b[3]])
-        } else {
-            u32::from_be_bytes([b[0], b[1], b[2], b[3]])
-        })
-    };
-    let read_ascii = |val_offset: usize, count: usize| -> Option<String> {
-        let slice = tiff.get(val_offset..val_offset + count)?;
-        let s = String::from_utf8_lossy(slice)
-            .trim_matches(char::from(0))
-            .trim()
-            .to_string();
-        if s.is_empty() { None } else { Some(s) }
-    };
-
-    let Some(ifd0_off) = r32(4).map(|v| v as usize) else {
-        return (None, None);
-    };
-
-    let mut date_str: Option<String> = None;
-    let mut camera_model: Option<String> = None;
-    let mut exif_sub_ifd: Option<usize> = None;
-
-    if let Some(entries) = r16(ifd0_off) {
-        for i in 0..entries as usize {
-            let entry_off = ifd0_off + 2 + i * 12;
-            let (Some(tag), Some(dtype), Some(count), Some(val_raw)) = (
-                r16(entry_off),
-                r16(entry_off + 2),
-                r32(entry_off + 4),
-                r32(entry_off + 8),
-            ) else {
-                break;
-            };
-            if tag == 0x8769 {
-                exif_sub_ifd = Some(val_raw as usize);
-            } else if dtype == 2 && (tag == 0x0110 || tag == 0x0132) {
-                let c = count as usize;
-                let str_off = if c <= 4 { entry_off + 8 } else { val_raw as usize };
-                if let Some(val) = read_ascii(str_off, c) {
-                    if tag == 0x0110 {
-                        camera_model = Some(
-                            val.chars()
-                                .map(|ch| if ch.is_alphanumeric() || ch == '-' { ch } else { '_' })
-                                .collect::<String>()
-                                .trim_matches('_')
-                                .to_string(),
-                        );
-                    } else if tag == 0x0132 && date_str.is_none() {
-                        date_str = format_exif_date(&val);
-                    }
-                }
-            }
-        }
-    }
-
-    if let Some(sub_off) = exif_sub_ifd {
-        if let Some(entries) = r16(sub_off) {
-            for i in 0..entries as usize {
-                let entry_off = sub_off + 2 + i * 12;
-                let (Some(tag), Some(dtype), Some(count), Some(val_raw)) = (
-                    r16(entry_off),
-                    r16(entry_off + 2),
-                    r32(entry_off + 4),
-                    r32(entry_off + 8),
-                ) else {
-                    break;
-                };
-                if dtype == 2 && (tag == 0x9003 || tag == 0x9004) {
-                    let c = count as usize;
-                    let str_off = if c <= 4 { entry_off + 8 } else { val_raw as usize };
-                    if let Some(val) = read_ascii(str_off, c) {
-                        if let Some(formatted) = format_exif_date(&val) {
-                            date_str = Some(formatted);
-                            break;
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    (date_str, camera_model)
-}
-
-fn format_exif_date(raw: &str) -> Option<String> {
-    if raw.len() >= 10 {
-        let d = &raw[0..10];
-        let clean: String = d
-            .chars()
-            .map(|c| if c == ':' { '-' } else { c })
-            .collect();
-        if clean.chars().take(4).all(|c| c.is_ascii_digit()) {
-            return Some(clean);
-        }
-    }
-    None
-}
-
-/// Построение LayoutJob с посимвольной подсветкой изменений (Diff)
 fn build_diff_layout_job(
     old_name: &str,
     new_name: &str,
@@ -720,11 +378,21 @@ fn build_diff_layout_job(
     job
 }
 
-fn is_image_ext(ext: &str) -> bool {
-    matches!(
-        ext,
-        "jpg" | "jpeg" | "png" | "webp" | "bmp" | "ico" | "gif"
-    )
+fn texture_from_memory(
+    ctx: &egui::Context,
+    id: &str,
+    bytes: &[u8],
+    max_dim: u32,
+) -> Option<(egui::TextureHandle, egui::Vec2)> {
+    let img = image::load_from_memory(bytes).ok()?;
+    let thumb = img.thumbnail(max_dim, max_dim);
+    let rgba = thumb.to_rgba8();
+    let tw = rgba.width() as usize;
+    let th = rgba.height() as usize;
+    let color_img =
+        egui::ColorImage::from_rgba_unmultiplied([tw, th], rgba.as_flat_samples().as_slice());
+    let tex = ctx.load_texture(id, color_img, egui::TextureOptions::LINEAR);
+    Some((tex, egui::vec2(tw as f32, th as f32)))
 }
 
 fn open_in_system(path: &Path) {
@@ -732,6 +400,8 @@ fn open_in_system(path: &Path) {
     {
         let _ = Command::new("explorer").arg(path).spawn();
     }
+    #[cfg(not(windows))]
+    let _ = path;
 }
 
 fn open_url_in_browser(url: &str) {
@@ -739,6 +409,8 @@ fn open_url_in_browser(url: &str) {
     {
         let _ = Command::new("explorer").arg(url).spawn();
     }
+    #[cfg(not(windows))]
+    let _ = url;
 }
 
 fn settings_file_path() -> PathBuf {
@@ -751,91 +423,6 @@ fn settings_file_path() -> PathBuf {
     }
 }
 
-#[derive(PartialEq, Clone, Copy)]
-enum Lang {
-    Ru,
-    En,
-}
-
-impl Lang {
-    fn tr(self, ru: &'static str, en: &'static str) -> &'static str {
-        match self {
-            Lang::Ru => ru,
-            Lang::En => en,
-        }
-    }
-}
-
-#[derive(PartialEq, Clone, Copy)]
-enum SortField {
-    NaturalName,
-    AlphaName,
-    ModifiedDate,
-    Size,
-    Extension,
-    FolderPath,
-}
-
-#[derive(PartialEq, Clone, Copy)]
-enum StatusFilter {
-    All,
-    OnlyChanged,
-    OnlyIncluded,
-    OnlyUnchanged,
-}
-
-#[derive(PartialEq, Clone, Copy)]
-enum SizeFilterMode {
-    Any,
-    GreaterThanKB,
-    LessThanKB,
-    BetweenKB,
-}
-
-#[derive(PartialEq, Clone, Copy)]
-enum CaseMode {
-    None,
-    Lower,
-    Upper,
-    Capitalize,
-    Title,
-}
-
-#[derive(PartialEq, Clone, Copy)]
-enum TranslitMode {
-    None,
-    RuToLat,
-    LatToRu,
-}
-
-#[derive(PartialEq, Clone, Copy)]
-enum NumMode {
-    None,
-    Suffix,
-    Prefix,
-}
-
-#[derive(PartialEq, Clone, Copy)]
-enum ExtMode {
-    Keep,
-    Lower,
-    Upper,
-    Remove,
-}
-
-#[derive(Clone)]
-struct UserPreset {
-    title: String,
-    find_str: String,
-    replace_str: String,
-    use_regex: bool,
-    prefix: String,
-    suffix: String,
-    translit_mode: TranslitMode,
-    case_mode: CaseMode,
-    sanitize: bool,
-}
-
 enum PreviewState {
     Empty,
     Folder {
@@ -845,15 +432,26 @@ enum PreviewState {
     Image {
         name: String,
         texture: egui::TextureHandle,
-        orig_w: u32,
-        orig_h: u32,
-        exif_info: String,
+        meta: photo_meta::PhotoMeta,
         tex_size: egui::Vec2,
+    },
+    PhotoMetaOnly {
+        name: String,
+        ext_upper: String,
+        meta: photo_meta::PhotoMeta,
     },
     Video {
         name: String,
         info: media_info::VideoMediaInfo,
         size_bytes: u64,
+        thumb: Option<(egui::TextureHandle, egui::Vec2)>,
+        loading_thumb: bool,
+    },
+    Audio {
+        name: String,
+        info: audio_info::AudioMediaInfo,
+        size_bytes: u64,
+        cover: Option<(egui::TextureHandle, egui::Vec2)>,
     },
     Text {
         name: String,
@@ -866,64 +464,50 @@ enum PreviewState {
     },
 }
 
-#[derive(Clone)]
-struct FsEntry {
-    path: PathBuf,
-    parent_dir: PathBuf,
-    parent_name: String,
-    rel_parent: String,
-    name: String,
-    ext_lower: String,
-    is_dir: bool,
-    is_hidden: bool,
-    depth: usize,
-    size: u64,
-    modified_ts: u64,
-    img_dims: Option<(u32, u32)>,
-    exif_date: Option<String>,
-    exif_camera: Option<String>,
-    video_info: Option<media_info::VideoMediaInfo>,
-}
-
-#[derive(Clone)]
-struct PreviewRow {
-    old_path: PathBuf,
-    parent_dir: PathBuf,
-    rel_parent: String,
-    is_dir: bool,
-    is_video: bool,
-    depth: usize,
-    size: u64,
-    modified_ts: u64,
-    old_name: String,
-    new_name: String,
-    included: bool,
-    changed: bool,
-}
-
 struct ReStemApp {
     lang: Lang,
     dark_mode: bool,
     ui_scale: f32,
     inline_diff: bool,
     use_external_mediainfo: bool,
+    check_updates: bool,
 
     current_dir: Option<PathBuf>,
     subfolders: Vec<PathBuf>,
     all_entries: Vec<FsEntry>,
     preview_rows: Vec<PreviewRow>,
     excluded_paths: HashSet<PathBuf>,
+    manual_overrides: HashMap<PathBuf, String>,
+    hash_cache: HashCache,
 
-    undo_stack: Vec<Vec<(PathBuf, PathBuf)>>,
+    undo_stack: Vec<UndoBatch>,
+
+    scan_job: Option<ScanJob>,
+    video_thumb_rx: Option<mpsc::Receiver<(PathBuf, Option<Vec<u8>>)>>,
 
     selected_path: Option<PathBuf>,
     preview_state: PreviewState,
+
+    editing_row_path: Option<PathBuf>,
+    editing_row_text: String,
+
     confirm_trash_modal: bool,
     show_about_modal: bool,
     show_regex_help_modal: bool,
     show_list_rename_modal: bool,
+    show_duplicates_modal: bool,
 
-    user_presets: Vec<UserPreset>,
+    dup_scanning: bool,
+    dup_progress: (usize, usize),
+    dup_cancel: Option<Arc<AtomicBool>>,
+    dup_rx: Option<mpsc::Receiver<DupScanMsg>>,
+    dup_groups: Vec<DuplicateGroup>,
+    dup_checked: HashSet<PathBuf>,
+
+    update_state: UpdateCheckState,
+    update_rx: Option<mpsc::Receiver<Result<Option<UpdateInfo>, String>>>,
+
+    user_presets: Vec<FullPreset>,
     new_preset_title: String,
 
     sort_field: SortField,
@@ -950,6 +534,8 @@ struct ReStemApp {
     replace_str: String,
     use_regex: bool,
     case_sensitive: bool,
+    extra_replaces: Vec<ReplaceStep>,
+    rule_order: Vec<RuleStage>,
 
     case_mode: CaseMode,
     translit_mode: TranslitMode,
@@ -976,6 +562,12 @@ struct ReStemApp {
     ext_mode: ExtMode,
     new_ext: String,
 
+    auto_suffix_duplicates: bool,
+    sync_sidecars: bool,
+    organize_enabled: bool,
+    organize_template: String,
+
+    issue_count: usize,
     status_msg: String,
 }
 
@@ -987,20 +579,41 @@ impl Default for ReStemApp {
             ui_scale: 1.0,
             inline_diff: true,
             use_external_mediainfo: true,
+            check_updates: true,
 
             current_dir: None,
             subfolders: Vec::new(),
             all_entries: Vec::new(),
             preview_rows: Vec::new(),
             excluded_paths: HashSet::new(),
+            manual_overrides: HashMap::new(),
+            hash_cache: HashCache::new(),
             undo_stack: Vec::new(),
+
+            scan_job: None,
+            video_thumb_rx: None,
 
             selected_path: None,
             preview_state: PreviewState::Empty,
+
+            editing_row_path: None,
+            editing_row_text: String::new(),
+
             confirm_trash_modal: false,
             show_about_modal: false,
             show_regex_help_modal: false,
             show_list_rename_modal: false,
+            show_duplicates_modal: false,
+
+            dup_scanning: false,
+            dup_progress: (0, 0),
+            dup_cancel: None,
+            dup_rx: None,
+            dup_groups: Vec::new(),
+            dup_checked: HashSet::new(),
+
+            update_state: UpdateCheckState::Idle,
+            update_rx: None,
 
             user_presets: Vec::new(),
             new_preset_title: String::new(),
@@ -1029,6 +642,8 @@ impl Default for ReStemApp {
             replace_str: String::new(),
             use_regex: false,
             case_sensitive: true,
+            extra_replaces: Vec::new(),
+            rule_order: default_rule_order(),
 
             case_mode: CaseMode::None,
             translit_mode: TranslitMode::None,
@@ -1054,58 +669,171 @@ impl Default for ReStemApp {
 
             ext_mode: ExtMode::Keep,
             new_ext: String::new(),
+
+            auto_suffix_duplicates: false,
+            sync_sidecars: false,
+            organize_enabled: false,
+            organize_template: String::new(),
+
+            issue_count: 0,
             status_msg: "Выберите папку или перетащите её мышью в окно программы.".to_string(),
         }
     }
 }
 
 impl ReStemApp {
-    fn save_settings(&self) {
-        let mut lines = Vec::new();
-        lines.push(format!("lang={}", if self.lang == Lang::Ru { "ru" } else { "en" }));
-        lines.push(format!("dark_mode={}", self.dark_mode));
-        lines.push(format!("ui_scale={:.2}", self.ui_scale));
-        lines.push(format!("inline_diff={}", self.inline_diff));
-        lines.push(format!(
-            "use_external_mediainfo={}",
-            self.use_external_mediainfo
-        ));
-
-        for p in &self.user_presets {
-            let t_code = match p.translit_mode {
-                TranslitMode::None => 0,
-                TranslitMode::RuToLat => 1,
-                TranslitMode::LatToRu => 2,
-            };
-            let c_code = match p.case_mode {
-                CaseMode::None => 0,
-                CaseMode::Lower => 1,
-                CaseMode::Upper => 2,
-                CaseMode::Capitalize => 3,
-                CaseMode::Title => 4,
-            };
-            lines.push(format!(
-                "preset={}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
-                p.title.replace('\t', " "),
-                p.find_str.replace('\t', " "),
-                p.replace_str.replace('\t', " "),
-                p.use_regex,
-                p.prefix.replace('\t', " "),
-                p.suffix.replace('\t', " "),
-                t_code,
-                c_code,
-                p.sanitize
-            ));
+    fn to_rename_config(&self) -> RenameConfig {
+        RenameConfig {
+            sort_field: self.sort_field,
+            sort_asc: self.sort_asc,
+            folders_first: self.folders_first,
+            search_query: self.search_query.clone(),
+            search_regex: self.search_regex,
+            search_case_sensitive: self.search_case_sensitive,
+            status_filter: self.status_filter,
+            include_files: self.include_files,
+            include_dirs: self.include_dirs,
+            hide_system_hidden: self.hide_system_hidden,
+            ext_filter: self.ext_filter.clone(),
+            ext_exclude_filter: self.ext_exclude_filter.clone(),
+            exclude_words_filter: self.exclude_words_filter.clone(),
+            size_filter_mode: self.size_filter_mode,
+            size_min_kb: self.size_min_kb,
+            size_max_kb: self.size_max_kb,
+            find_str: self.find_str.clone(),
+            replace_str: self.replace_str.clone(),
+            use_regex: self.use_regex,
+            case_sensitive: self.case_sensitive,
+            extra_replaces: self.extra_replaces.clone(),
+            rule_order: self.rule_order.clone(),
+            case_mode: self.case_mode,
+            translit_mode: self.translit_mode,
+            sanitize_names: self.sanitize_names,
+            prefix: self.prefix.clone(),
+            suffix: self.suffix.clone(),
+            trim_start: self.trim_start,
+            trim_end: self.trim_end,
+            insert_text: self.insert_text.clone(),
+            insert_pos: self.insert_pos,
+            insert_from_end: self.insert_from_end,
+            use_custom_list: self.use_custom_list,
+            custom_list_raw: self.custom_list_raw.clone(),
+            num_mode: self.num_mode,
+            num_start: self.num_start,
+            num_step: self.num_step,
+            num_pad: self.num_pad,
+            num_sep: self.num_sep.clone(),
+            reset_num_per_dir: self.reset_num_per_dir,
+            ext_mode: self.ext_mode,
+            new_ext: self.new_ext.clone(),
+            auto_suffix_duplicates: self.auto_suffix_duplicates,
+            sync_sidecars: self.sync_sidecars,
+            organize_enabled: self.organize_enabled,
+            organize_template: self.organize_template.clone(),
         }
+    }
 
+    fn capture_full_preset(&self, title: String) -> FullPreset {
+        FullPreset {
+            title,
+            find_str: self.find_str.clone(),
+            replace_str: self.replace_str.clone(),
+            use_regex: self.use_regex,
+            case_sensitive: self.case_sensitive,
+            extra_replaces: self.extra_replaces.clone(),
+            rule_order: self.rule_order.clone(),
+            case_mode: self.case_mode,
+            translit_mode: self.translit_mode,
+            sanitize_names: self.sanitize_names,
+            prefix: self.prefix.clone(),
+            suffix: self.suffix.clone(),
+            trim_start: self.trim_start,
+            trim_end: self.trim_end,
+            insert_text: self.insert_text.clone(),
+            insert_pos: self.insert_pos,
+            insert_from_end: self.insert_from_end,
+            num_mode: self.num_mode,
+            num_start: self.num_start,
+            num_step: self.num_step,
+            num_pad: self.num_pad,
+            num_sep: self.num_sep.clone(),
+            reset_num_per_dir: self.reset_num_per_dir,
+            ext_mode: self.ext_mode,
+            new_ext: self.new_ext.clone(),
+            ext_filter: self.ext_filter.clone(),
+            ext_exclude_filter: self.ext_exclude_filter.clone(),
+            exclude_words_filter: self.exclude_words_filter.clone(),
+            size_filter_mode: self.size_filter_mode,
+            size_min_kb: self.size_min_kb,
+            size_max_kb: self.size_max_kb,
+            auto_suffix_duplicates: self.auto_suffix_duplicates,
+            sync_sidecars: self.sync_sidecars,
+            organize_enabled: self.organize_enabled,
+            organize_template: self.organize_template.clone(),
+        }
+    }
+
+    fn apply_full_preset(&mut self, p: &FullPreset) {
+        self.find_str = p.find_str.clone();
+        self.replace_str = p.replace_str.clone();
+        self.use_regex = p.use_regex;
+        self.case_sensitive = p.case_sensitive;
+        self.extra_replaces = p.extra_replaces.clone();
+        self.rule_order = if p.rule_order.is_empty() {
+            default_rule_order()
+        } else {
+            p.rule_order.clone()
+        };
+        self.case_mode = p.case_mode;
+        self.translit_mode = p.translit_mode;
+        self.sanitize_names = p.sanitize_names;
+        self.prefix = p.prefix.clone();
+        self.suffix = p.suffix.clone();
+        self.trim_start = p.trim_start;
+        self.trim_end = p.trim_end;
+        self.insert_text = p.insert_text.clone();
+        self.insert_pos = p.insert_pos;
+        self.insert_from_end = p.insert_from_end;
+        self.num_mode = p.num_mode;
+        self.num_start = p.num_start;
+        self.num_step = p.num_step;
+        self.num_pad = p.num_pad;
+        self.num_sep = p.num_sep.clone();
+        self.reset_num_per_dir = p.reset_num_per_dir;
+        self.ext_mode = p.ext_mode;
+        self.new_ext = p.new_ext.clone();
+        self.ext_filter = p.ext_filter.clone();
+        self.ext_exclude_filter = p.ext_exclude_filter.clone();
+        self.exclude_words_filter = p.exclude_words_filter.clone();
+        self.size_filter_mode = p.size_filter_mode;
+        self.size_min_kb = p.size_min_kb;
+        self.size_max_kb = p.size_max_kb;
+        self.auto_suffix_duplicates = p.auto_suffix_duplicates;
+        self.sync_sidecars = p.sync_sidecars;
+        self.organize_enabled = p.organize_enabled;
+        self.organize_template = p.organize_template.clone();
+    }
+
+    fn save_settings(&self) {
+        let lines = vec![
+            format!("lang={}", if self.lang == Lang::Ru { "ru" } else { "en" }),
+            format!("dark_mode={}", self.dark_mode),
+            format!("ui_scale={:.2}", self.ui_scale),
+            format!("inline_diff={}", self.inline_diff),
+            format!("use_external_mediainfo={}", self.use_external_mediainfo),
+            format!("check_updates={}", self.check_updates),
+        ];
         let _ = fs::write(settings_file_path(), lines.join("\n"));
+        save_presets_json(&self.user_presets);
     }
 
     fn load_settings(&mut self) {
+        self.user_presets = load_presets_json();
+
         let Ok(content) = fs::read_to_string(settings_file_path()) else {
             return;
         };
-        self.user_presets.clear();
+        let mut migrated = false;
         for line in content.lines() {
             if let Some(val) = line.strip_prefix("lang=") {
                 self.lang = if val.trim() == "en" { Lang::En } else { Lang::Ru };
@@ -1119,38 +847,110 @@ impl ReStemApp {
                 self.inline_diff = val.trim() == "true";
             } else if let Some(val) = line.strip_prefix("use_external_mediainfo=") {
                 self.use_external_mediainfo = val.trim() != "false";
+            } else if let Some(val) = line.strip_prefix("check_updates=") {
+                self.check_updates = val.trim() != "false";
             } else if let Some(val) = line.strip_prefix("preset=") {
-                let parts: Vec<&str> = val.split('\t').collect();
-                if parts.len() == 9 {
-                    let translit_mode = match parts[6] {
-                        "1" => TranslitMode::RuToLat,
-                        "2" => TranslitMode::LatToRu,
-                        _ => TranslitMode::None,
+                if self.user_presets.is_empty() {
+                    let parts: Vec<&str> = val.split('\t').collect();
+                    if parts.len() == 9 {
+                        let translit_mode = match parts[6] {
+                            "1" => TranslitMode::RuToLat,
+                            "2" => TranslitMode::LatToRu,
+                            _ => TranslitMode::None,
+                        };
+                        let case_mode = match parts[7] {
+                            "1" => CaseMode::Lower,
+                            "2" => CaseMode::Upper,
+                            "3" => CaseMode::Capitalize,
+                            "4" => CaseMode::Title,
+                            _ => CaseMode::None,
+                        };
+                        let mut fp = FullPreset::default();
+                        fp.title = parts[0].to_string();
+                        fp.find_str = parts[1].to_string();
+                        fp.replace_str = parts[2].to_string();
+                        fp.use_regex = parts[3] == "true";
+                        fp.prefix = parts[4].to_string();
+                        fp.suffix = parts[5].to_string();
+                        fp.translit_mode = translit_mode;
+                        fp.case_mode = case_mode;
+                        fp.sanitize_names = parts[8] == "true";
+                        self.user_presets.push(fp);
+                        migrated = true;
+                    }
+                }
+            }
+        }
+        if migrated {
+            save_presets_json(&self.user_presets);
+        }
+    }
+
+    fn export_presets_json_dialog(&mut self) {
+        if let Some(save_path) = rfd::FileDialog::new()
+            .set_file_name("restem_presets.json")
+            .add_filter("JSON Presets (.json)", &["json"])
+            .save_file()
+        {
+            if let Ok(json) = serde_json::to_string_pretty(&self.user_presets) {
+                if fs::write(&save_path, json).is_ok() {
+                    self.status_msg = match self.lang {
+                        Lang::Ru => format!("Пресеты сохранены: {}", save_path.display()),
+                        Lang::En => format!("Presets exported: {}", save_path.display()),
                     };
-                    let case_mode = match parts[7] {
-                        "1" => CaseMode::Lower,
-                        "2" => CaseMode::Upper,
-                        "3" => CaseMode::Capitalize,
-                        "4" => CaseMode::Title,
-                        _ => CaseMode::None,
-                    };
-                    self.user_presets.push(UserPreset {
-                        title: parts[0].to_string(),
-                        find_str: parts[1].to_string(),
-                        replace_str: parts[2].to_string(),
-                        use_regex: parts[3] == "true",
-                        prefix: parts[4].to_string(),
-                        suffix: parts[5].to_string(),
-                        translit_mode,
-                        case_mode,
-                        sanitize: parts[8] == "true",
-                    });
                 }
             }
         }
     }
 
+    fn import_presets_json_dialog(&mut self) {
+        if let Some(path) = rfd::FileDialog::new()
+            .add_filter("JSON Presets (.json)", &["json"])
+            .pick_file()
+        {
+            if let Ok(raw) = fs::read_to_string(&path) {
+                let imported: Vec<FullPreset> =
+                    if let Ok(list) = serde_json::from_str::<Vec<FullPreset>>(&raw) {
+                        list
+                    } else if let Ok(single) = serde_json::from_str::<FullPreset>(&raw) {
+                        vec![single]
+                    } else {
+                        Vec::new()
+                    };
+
+                if !imported.is_empty() {
+                    let count = imported.len();
+                    for p in imported {
+                        if let Some(existing) =
+                            self.user_presets.iter_mut().find(|e| e.title == p.title)
+                        {
+                            *existing = p;
+                        } else {
+                            self.user_presets.push(p);
+                        }
+                    }
+                    save_presets_json(&self.user_presets);
+                    self.status_msg = match self.lang {
+                        Lang::Ru => format!("Импортировано пресетов: {}", count),
+                        Lang::En => format!("Imported presets: {}", count),
+                    };
+                }
+            }
+        }
+    }
+
+    fn trigger_update_check(&mut self, ctx: &egui::Context) {
+        self.update_state = UpdateCheckState::Checking;
+        self.update_rx = Some(updater::start_update_check(
+            APP_VERSION,
+            GITHUB_REPO_URL,
+            ctx.clone(),
+        ));
+    }
+
     fn register_explorer_context_menu(&mut self, install: bool) {
+        #[cfg(not(windows))]
+        let _ = install;
         #[cfg(windows)]
         {
             if install {
@@ -1231,24 +1031,8 @@ impl ReStemApp {
             .add_filter("Batch Script (.bat)", &["bat"])
             .save_file()
         {
-            let mut lines = vec![
-                "@echo off".to_string(),
-                "chcp 65001 >nul".to_string(),
-                "echo Restoring filenames via ReStem rollback script...".to_string(),
-            ];
-            for (curr_path, orig_path) in last_batch.iter().rev() {
-                if let Some(orig_name) = orig_path.file_name() {
-                    lines.push(format!(
-                        "ren \"{}\" \"{}\"",
-                        curr_path.display(),
-                        orig_name.to_string_lossy()
-                    ));
-                }
-            }
-            lines.push("echo Done!".to_string());
-            lines.push("pause".to_string());
-
-            if fs::write(&save_path, lines.join("\r\n")).is_ok() {
+            let content = build_rollback_bat(last_batch);
+            if fs::write(&save_path, content).is_ok() {
                 self.status_msg = match self.lang {
                     Lang::Ru => format!("Скрипт отката сохранён: {}", save_path.display()),
                     Lang::En => format!("Rollback script saved: {}", save_path.display()),
@@ -1270,29 +1054,6 @@ impl ReStemApp {
         }
     }
 
-    fn is_entry_hidden(path: &Path, meta: Option<&fs::Metadata>) -> bool {
-        let name = path.file_name().unwrap_or_default().to_string_lossy();
-        if name.starts_with('.')
-            || name.eq_ignore_ascii_case("node_modules")
-            || name.eq_ignore_ascii_case("$RECYCLE.BIN")
-            || name.eq_ignore_ascii_case("System Volume Information")
-        {
-            return true;
-        }
-        #[cfg(windows)]
-        if let Some(m) = meta {
-            use std::os::windows::fs::MetadataExt;
-            let attrs = m.file_attributes();
-            if (attrs & 0x2) != 0 || (attrs & 0x4) != 0 {
-                return true;
-            }
-        }
-        #[cfg(not(windows))]
-        let _ = meta;
-
-        false
-    }
-
     fn select_for_preview(&mut self, path: PathBuf, ctx: &egui::Context) {
         let name = path
             .file_name()
@@ -1300,6 +1061,7 @@ impl ReStemApp {
             .to_string_lossy()
             .to_string();
         self.selected_path = Some(path.clone());
+        self.video_thumb_rx = None;
 
         if path.is_dir() {
             let count = fs::read_dir(&path)
@@ -1318,21 +1080,21 @@ impl ReStemApp {
             .to_string_lossy()
             .to_lowercase();
 
-        if is_image_ext(&ext) {
-            let (exif_d, exif_cam) = extract_jpeg_exif(&path);
-            let mut exif_parts = Vec::new();
-            if let Some(d) = exif_d {
-                exif_parts.push(format!("📅 {}", d));
-            }
-            if let Some(c) = exif_cam {
-                exif_parts.push(format!("📷 {}", c));
-            }
-            let exif_info = exif_parts.join("  •  ");
+        if photo_meta::is_previewable_image_ext(&ext) {
+            let meta = self
+                .all_entries
+                .iter()
+                .find(|e| e.path == path)
+                .and_then(|e| e.photo_meta.clone())
+                .unwrap_or_else(|| photo_meta::extract_photo_meta(&path, &ext));
 
             match image::open(&path) {
                 Ok(img) => {
-                    let orig_w = img.width();
-                    let orig_h = img.height();
+                    let mut final_meta = meta;
+                    if final_meta.width.is_none() || final_meta.height.is_none() {
+                        final_meta.width = Some(img.width());
+                        final_meta.height = Some(img.height());
+                    }
                     let thumb = img.thumbnail(320, 320);
                     let rgba = thumb.to_rgba8();
                     let tw = rgba.width() as usize;
@@ -1349,9 +1111,7 @@ impl ReStemApp {
                     self.preview_state = PreviewState::Image {
                         name,
                         texture,
-                        orig_w,
-                        orig_h,
-                        exif_info,
+                        meta: final_meta,
                         tex_size: egui::vec2(tw as f32, th as f32),
                     };
                 }
@@ -1362,6 +1122,21 @@ impl ReStemApp {
                     };
                 }
             }
+            return;
+        }
+
+        if photo_meta::is_photo_meta_ext(&ext) {
+            let meta = self
+                .all_entries
+                .iter()
+                .find(|e| e.path == path)
+                .and_then(|e| e.photo_meta.clone())
+                .unwrap_or_else(|| photo_meta::extract_photo_meta(&path, &ext));
+            self.preview_state = PreviewState::PhotoMetaOnly {
+                name,
+                ext_upper: ext.to_uppercase(),
+                meta,
+            };
             return;
         }
 
@@ -1376,10 +1151,47 @@ impl ReStemApp {
                     media_info::extract_video_info(&path, size_bytes, self.use_external_mediainfo)
                 })
                 .unwrap_or_default();
+
+            let loading_thumb = media_info::has_ffmpeg();
+            if loading_thumb {
+                let (tx, rx) = mpsc::channel();
+                let p_clone = path.clone();
+                let dur = info.duration_secs;
+                let ctx_clone = ctx.clone();
+                std::thread::spawn(move || {
+                    let png = media_info::extract_video_thumbnail_png(&p_clone, dur);
+                    let _ = tx.send((p_clone, png));
+                    ctx_clone.request_repaint();
+                });
+                self.video_thumb_rx = Some(rx);
+            }
+
             self.preview_state = PreviewState::Video {
                 name,
                 info,
                 size_bytes,
+                thumb: None,
+                loading_thumb,
+            };
+            return;
+        }
+
+        if audio_info::is_audio_ext(&ext) {
+            let size_bytes = fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+            let info = self
+                .all_entries
+                .iter()
+                .find(|e| e.path == path)
+                .and_then(|e| e.audio_info.clone())
+                .or_else(|| audio_info::extract_audio_info(&path, size_bytes))
+                .unwrap_or_default();
+            let cover = audio_info::extract_audio_cover(&path)
+                .and_then(|bytes| texture_from_memory(ctx, "item_preview_cover", &bytes, 240));
+            self.preview_state = PreviewState::Audio {
+                name,
+                info,
+                size_bytes,
+                cover,
             };
             return;
         }
@@ -1434,7 +1246,7 @@ impl ReStemApp {
         }
     }
 
-    fn delete_paths_to_trash(&mut self, targets: Vec<PathBuf>) {
+    fn delete_paths_to_trash(&mut self, targets: Vec<PathBuf>, ctx: &egui::Context) {
         if targets.is_empty() {
             return;
         }
@@ -1443,13 +1255,15 @@ impl ReStemApp {
             Ok(()) => {
                 for p in &targets {
                     self.excluded_paths.remove(p);
+                    self.manual_overrides.remove(p);
+                    self.hash_cache.remove(p);
                     if self.selected_path.as_ref() == Some(p) {
                         self.selected_path = None;
                         self.preview_state = PreviewState::Empty;
                     }
                 }
                 if let Some(dir) = self.current_dir.clone() {
-                    self.load_directory(dir);
+                    self.load_directory(dir, ctx);
                 }
                 self.status_msg = match self.lang {
                     Lang::Ru => format!("Перемещено в Корзину объектов: {}", count),
@@ -1465,183 +1279,157 @@ impl ReStemApp {
         }
     }
 
-    fn open_new_directory(&mut self, root_dir: PathBuf) {
-        if self.current_dir.as_ref() != Some(&root_dir) {
-            self.excluded_paths.clear();
-            self.selected_path = None;
-            self.preview_state = PreviewState::Empty;
+    fn start_duplicate_scan(&mut self, ctx: &egui::Context) {
+        if let Some(c) = &self.dup_cancel {
+            c.store(true, Ordering::Relaxed);
         }
-        self.load_directory(root_dir);
+        let candidates: Vec<(PathBuf, u64)> = self
+            .all_entries
+            .iter()
+            .filter(|e| !e.is_dir && e.size > 0)
+            .map(|e| (e.path.clone(), e.size))
+            .collect();
+
+        let (tx, rx) = mpsc::channel();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let cancel_worker = Arc::clone(&cancel);
+        let ctx_clone = ctx.clone();
+
+        self.dup_scanning = true;
+        self.dup_progress = (0, candidates.len());
+        self.dup_cancel = Some(cancel);
+        self.dup_rx = Some(rx);
+        self.dup_groups.clear();
+        self.dup_checked.clear();
+
+        std::thread::spawn(move || {
+            let groups = hash_utils::find_duplicates_bg(candidates, cancel_worker, |done, total| {
+                if done == 1 || done == total || done % 4 == 0 {
+                    let _ = tx.send(DupScanMsg::Progress { done, total });
+                    ctx_clone.request_repaint();
+                }
+            });
+            let _ = tx.send(DupScanMsg::Done(groups));
+            ctx_clone.request_repaint();
+        });
     }
 
-    fn load_directory(&mut self, root_dir: PathBuf) {
-        let mut entries = Vec::new();
-        let mut subs = Vec::new();
+    fn open_new_directory(&mut self, root_dir: PathBuf, ctx: &egui::Context) {
+        if self.current_dir.as_ref() != Some(&root_dir) {
+            self.excluded_paths.clear();
+            self.manual_overrides.clear();
+            self.hash_cache.clear();
+            self.selected_path = None;
+            self.preview_state = PreviewState::Empty;
+            self.editing_row_path = None;
+            self.dup_groups.clear();
+            self.dup_checked.clear();
+        }
+        self.load_directory(root_dir, ctx);
+    }
 
-        if let Ok(read_top) = fs::read_dir(&root_dir) {
-            for e in read_top.flatten() {
-                let p = e.path();
-                if p.is_dir() {
-                    let meta = e.metadata().ok();
-                    if self.hide_system_hidden && Self::is_entry_hidden(&p, meta.as_ref()) {
-                        continue;
+    fn load_directory(&mut self, root_dir: PathBuf, ctx: &egui::Context) {
+        if let Some(prev) = &self.scan_job {
+            prev.cancel.store(true, Ordering::Relaxed);
+        }
+        self.current_dir = Some(root_dir.clone());
+        self.scan_job = Some(scanner::start_background_scan(
+            root_dir,
+            self.recursive,
+            self.hide_system_hidden,
+            self.use_external_mediainfo,
+            ctx.clone(),
+        ));
+    }
+
+    fn poll_background_tasks(&mut self, ctx: &egui::Context) {
+        let mut finished_scan: Option<ScanMsg> = None;
+        if let Some(job) = &mut self.scan_job {
+            while let Ok(msg) = job.rx.try_recv() {
+                match msg {
+                    ScanMsg::Progress {
+                        scanned,
+                        current_name,
+                    } => {
+                        job.scanned = scanned;
+                        job.current_name = current_name;
                     }
-                    subs.push(p);
+                    done @ ScanMsg::Done { .. } => {
+                        finished_scan = Some(done);
+                    }
                 }
             }
         }
-        subs.sort_by(|a, b| {
-            let na = a.file_name().unwrap_or_default().to_string_lossy();
-            let nb = b.file_name().unwrap_or_default().to_string_lossy();
-            natural_cmp(&na, &nb)
-        });
-        self.subfolders = subs;
-
-        self.collect_entries(&root_dir, &root_dir, 0, &mut entries);
-
-        self.current_dir = Some(root_dir);
-        self.all_entries = entries;
-        self.recalculate_preview();
-    }
-
-    fn collect_entries(
-        &self,
-        root: &Path,
-        current: &Path,
-        depth: usize,
-        out: &mut Vec<FsEntry>,
-    ) {
-        let Ok(read_dir) = fs::read_dir(current) else {
-            return;
-        };
-
-        for entry in read_dir.flatten() {
-            let path = entry.path();
-            let meta = entry.metadata().ok();
-            let is_dir = meta
-                .as_ref()
-                .map(|m| m.is_dir())
-                .unwrap_or_else(|| path.is_dir());
-            let size = meta.as_ref().map(|m| m.len()).unwrap_or(0);
-            let modified_ts = meta
-                .as_ref()
-                .and_then(|m| m.modified().ok())
-                .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-                .map(|d| d.as_secs())
-                .unwrap_or(0);
-
-            let is_hidden = Self::is_entry_hidden(&path, meta.as_ref());
-            if self.hide_system_hidden && is_hidden {
-                continue;
+        if let Some(ScanMsg::Done {
+            root_dir,
+            entries,
+            subfolders,
+            cancelled,
+        }) = finished_scan
+        {
+            self.scan_job = None;
+            if !cancelled {
+                self.current_dir = Some(root_dir);
+                self.subfolders = subfolders;
+                self.all_entries = entries;
+                self.recalculate_preview();
+            } else {
+                self.status_msg = self
+                    .lang
+                    .tr("Сканирование отменено пользователем.", "Scan cancelled.")
+                    .to_string();
             }
+        }
 
-            let parent_dir = path.parent().unwrap_or(root).to_path_buf();
-            let parent_name = parent_dir
-                .file_name()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .to_string();
+        if let Some(rx) = &self.video_thumb_rx {
+            if let Ok((target_path, png_opt)) = rx.try_recv() {
+                self.video_thumb_rx = None;
+                if self.selected_path.as_ref() == Some(&target_path) {
+                    if let PreviewState::Video {
+                        thumb,
+                        loading_thumb,
+                        ..
+                    } = &mut self.preview_state
+                    {
+                        *loading_thumb = false;
+                        if let Some(bytes) = png_opt {
+                            *thumb =
+                                texture_from_memory(ctx, "item_preview_video_frame", &bytes, 320);
+                        }
+                    }
+                }
+            }
+        }
 
-            let rel_parent = parent_dir
-                .strip_prefix(root)
-                .ok()
-                .map(|p| p.display().to_string())
-                .unwrap_or_default();
+        let mut dup_done: Option<Vec<DuplicateGroup>> = None;
+        if let Some(rx) = &self.dup_rx {
+            while let Ok(msg) = rx.try_recv() {
+                match msg {
+                    DupScanMsg::Progress { done, total } => {
+                        self.dup_progress = (done, total);
+                    }
+                    DupScanMsg::Done(groups) => {
+                        dup_done = Some(groups);
+                    }
+                }
+            }
+        }
+        if let Some(groups) = dup_done {
+            self.dup_scanning = false;
+            self.dup_rx = None;
+            self.dup_cancel = None;
+            self.dup_groups = groups;
+        }
 
-            let rel_display = if rel_parent.is_empty() {
-                ".".to_string()
-            } else {
-                rel_parent
-            };
-
-            let name = path
-                .file_name()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .to_string();
-
-            let ext_lower = if is_dir {
-                String::new()
-            } else {
-                path.extension()
-                    .unwrap_or_default()
-                    .to_string_lossy()
-                    .to_lowercase()
-            };
-
-            let (img_dims, exif_date, exif_camera, video_info) =
-                if !is_dir && is_image_ext(&ext_lower) {
-                    let dims = image::image_dimensions(&path).ok();
-                    let (ed, ec) = if ext_lower == "jpg" || ext_lower == "jpeg" {
-                        extract_jpeg_exif(&path)
-                    } else {
-                        (None, None)
-                    };
-                    (dims, ed, ec, None)
-                } else if !is_dir && media_info::is_video_ext(&ext_lower) {
-                    let vinfo =
-                        media_info::extract_video_info(&path, size, self.use_external_mediainfo);
-                    (None, None, None, vinfo)
-                } else {
-                    (None, None, None, None)
+        if let Some(rx) = &self.update_rx {
+            if let Ok(res) = rx.try_recv() {
+                self.update_rx = None;
+                self.update_state = match res {
+                    Ok(Some(info)) => UpdateCheckState::Available(info),
+                    Ok(None) => UpdateCheckState::UpToDate,
+                    Err(_) => UpdateCheckState::Failed,
                 };
-
-            out.push(FsEntry {
-                path: path.clone(),
-                parent_dir,
-                parent_name,
-                rel_parent: rel_display,
-                name,
-                ext_lower,
-                is_dir,
-                is_hidden,
-                depth,
-                size,
-                modified_ts,
-                img_dims,
-                exif_date,
-                exif_camera,
-                video_info,
-            });
-
-            if is_dir && self.recursive {
-                self.collect_entries(root, &path, depth + 1, out);
             }
-        }
-    }
-
-    fn compare_entries(&self, a: &FsEntry, b: &FsEntry) -> Ordering {
-        if self.folders_first && a.is_dir != b.is_dir {
-            return b.is_dir.cmp(&a.is_dir);
-        }
-
-        let base_ord = match self.sort_field {
-            SortField::NaturalName => natural_cmp(&a.name, &b.name),
-            SortField::AlphaName => a
-                .name
-                .to_lowercase()
-                .cmp(&b.name.to_lowercase())
-                .then_with(|| a.name.cmp(&b.name)),
-            SortField::ModifiedDate => a
-                .modified_ts
-                .cmp(&b.modified_ts)
-                .then_with(|| natural_cmp(&a.name, &b.name)),
-            SortField::Size => a
-                .size
-                .cmp(&b.size)
-                .then_with(|| natural_cmp(&a.name, &b.name)),
-            SortField::Extension => a
-                .ext_lower
-                .cmp(&b.ext_lower)
-                .then_with(|| natural_cmp(&a.name, &b.name)),
-            SortField::FolderPath => natural_cmp(&a.rel_parent, &b.rel_parent)
-                .then_with(|| natural_cmp(&a.name, &b.name)),
-        };
-
-        if self.sort_asc {
-            base_ord
-        } else {
-            base_ord.reverse()
         }
     }
 
@@ -1655,444 +1443,43 @@ impl ReStemApp {
         self.recalculate_preview();
     }
 
-    /// Подстановка умных тегов {date}, {year}, {month}, {day}, {parent}, {w}x{h}, {exif_date}, {camera}
-    /// и видео-тегов MediaInfo ({res}, {vcodec}, {acodec}, {ach}, {fps}, {duration}, {bitrate}, {hdr}, {media_date})
-    fn expand_smart_tags(&self, template: &str, entry: &FsEntry) -> String {
-        if !template.contains('{') {
-            return template.to_string();
-        }
-        let (year, month, day, _, _) = decompose_timestamp(entry.modified_ts);
-        let date_s = format!("{:04}-{:02}-{:02}", year, month, day);
-        let year_s = format!("{:04}", year);
-        let month_s = format!("{:02}", month);
-        let day_s = format!("{:02}", day);
-
-        let exif_d = entry.exif_date.as_deref().unwrap_or(&date_s);
-        let cam_s = entry.exif_camera.as_deref().unwrap_or("");
-
-        let dims = entry
-            .img_dims
-            .or_else(|| entry.video_info.as_ref().and_then(|v| v.dimensions()));
-        let (w_s, h_s, wxh_s) = if let Some((w, h)) = dims {
-            (w.to_string(), h.to_string(), format!("{}x{}", w, h))
-        } else {
-            (String::new(), String::new(), String::new())
-        };
-
-        let (
-            res_s,
-            vcodec_s,
-            acodec_s,
-            ach_s,
-            fps_s,
-            dur_s,
-            bitrate_s,
-            hdr_s,
-            media_date_s,
-        ) = if let Some(v) = entry.video_info.as_ref() {
-            (
-                v.resolution_label().unwrap_or_default(),
-                v.video_codec.clone().unwrap_or_default(),
-                v.audio_codec.clone().unwrap_or_default(),
-                v.audio_channels_tag().unwrap_or_default(),
-                v.fps_tag().unwrap_or_default(),
-                v.duration_tag().unwrap_or_default(),
-                v.bitrate_tag().unwrap_or_default(),
-                v.hdr.clone().unwrap_or_default(),
-                v.recorded_date.as_deref().unwrap_or(&date_s).to_string(),
-            )
-        } else {
-            (
-                String::new(),
-                String::new(),
-                String::new(),
-                String::new(),
-                String::new(),
-                String::new(),
-                String::new(),
-                String::new(),
-                date_s.clone(),
-            )
-        };
-
-        template
-            .replace("{date}", &date_s)
-            .replace("{year}", &year_s)
-            .replace("{month}", &month_s)
-            .replace("{day}", &day_s)
-            .replace("{exif_date}", exif_d)
-            .replace("{camera}", cam_s)
-            .replace("{parent}", &entry.parent_name)
-            .replace("{w}x{h}", &wxh_s)
-            .replace("{w}", &w_s)
-            .replace("{h}", &h_s)
-            .replace("{res}", &res_s)
-            .replace("{vcodec}", &vcodec_s)
-            .replace("{acodec}", &acodec_s)
-            .replace("{ach}", &ach_s)
-            .replace("{fps}", &fps_s)
-            .replace("{duration}", &dur_s)
-            .replace("{bitrate}", &bitrate_s)
-            .replace("{hdr}", &hdr_s)
-            .replace("{media_date}", &media_date_s)
-    }
-
-    fn compute_new_name(
-        &self,
-        entry: &FsEntry,
-        idx: usize,
-        custom_list_override: Option<&str>,
-    ) -> String {
-        let (mut stem, raw_ext) = if entry.is_dir {
-            (entry.name.clone(), String::new())
-        } else {
-            let s = entry
-                .path
-                .file_stem()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .to_string();
-            let e = entry
-                .path
-                .extension()
-                .map(|ext_os| ext_os.to_string_lossy().to_string())
-                .unwrap_or_default();
-            (s, e)
-        };
-
-        if let Some(custom_line) = custom_list_override {
-            let clean = custom_line.trim();
-            if !clean.is_empty() {
-                if entry.is_dir || clean.contains('.') {
-                    return clean.to_string();
-                } else if raw_ext.is_empty() {
-                    return clean.to_string();
-                } else {
-                    return format!("{}.{}", clean, raw_ext);
-                }
-            }
-        }
-
-        let chars: Vec<char> = stem.chars().collect();
-        let start = self.trim_start.min(chars.len());
-        let end = chars.len().saturating_sub(self.trim_end).max(start);
-        stem = chars[start..end].iter().collect();
-
-        if !self.find_str.is_empty() {
-            let pattern = if self.use_regex {
-                self.find_str.clone()
-            } else {
-                regex::escape(&self.find_str)
-            };
-            if let Ok(re) = RegexBuilder::new(&pattern)
-                .case_insensitive(!self.case_sensitive)
-                .build()
-            {
-                let rep_expanded = self.expand_smart_tags(&self.replace_str, entry);
-                stem = re.replace_all(&stem, rep_expanded.as_str()).to_string();
-            }
-        }
-
-        if !self.insert_text.is_empty() {
-            let ins_expanded = self.expand_smart_tags(&self.insert_text, entry);
-            let current_chars: Vec<char> = stem.chars().collect();
-            let idx_pos = if self.insert_from_end {
-                current_chars.len().saturating_sub(self.insert_pos.min(current_chars.len()))
-            } else {
-                self.insert_pos.min(current_chars.len())
-            };
-            let left: String = current_chars[..idx_pos].iter().collect();
-            let right: String = current_chars[idx_pos..].iter().collect();
-            stem = format!("{}{}{}", left, ins_expanded, right);
-        }
-
-        let pref_exp = self.expand_smart_tags(&self.prefix, entry);
-        let suff_exp = self.expand_smart_tags(&self.suffix, entry);
-        stem = format!("{}{}{}", pref_exp, stem, suff_exp);
-
-        stem = match self.translit_mode {
-            TranslitMode::None => stem,
-            TranslitMode::RuToLat => transliterate_ru_to_lat(&stem),
-            TranslitMode::LatToRu => transliterate_lat_to_ru(&stem),
-        };
-
-        if self.sanitize_names {
-            stem = sanitize_stem(&stem);
-        }
-
-        stem = match self.case_mode {
-            CaseMode::None => stem,
-            CaseMode::Lower => stem.to_lowercase(),
-            CaseMode::Upper => stem.to_uppercase(),
-            CaseMode::Capitalize => {
-                let mut c = stem.chars();
-                match c.next() {
-                    None => String::new(),
-                    Some(first) => {
-                        first.to_uppercase().collect::<String>() + &c.as_str().to_lowercase()
-                    }
-                }
-            }
-            CaseMode::Title => stem
-                .split_whitespace()
-                .map(|w| {
-                    let mut c = w.chars();
-                    match c.next() {
-                        None => String::new(),
-                        Some(f) => {
-                            f.to_uppercase().collect::<String>() + &c.as_str().to_lowercase()
-                        }
-                    }
-                })
-                .collect::<Vec<_>>()
-                .join(" "),
-        };
-
-        if self.num_mode != NumMode::None {
-            let num = self.num_start + idx * self.num_step.max(1);
-            let num_str = format!("{:0width$}", num, width = self.num_pad.max(1));
-            stem = match self.num_mode {
-                NumMode::Suffix if !stem.is_empty() => {
-                    format!("{}{}{}", stem, self.num_sep, num_str)
-                }
-                NumMode::Prefix if !stem.is_empty() => {
-                    format!("{}{}{}", num_str, self.num_sep, stem)
-                }
-                _ => num_str,
-            };
-        }
-
-        let final_ext = if entry.is_dir {
-            String::new()
-        } else {
-            let custom_clean = self.new_ext.trim().trim_start_matches('.');
-            let mut ext_val = if !custom_clean.is_empty() {
-                custom_clean.to_string()
-            } else {
-                raw_ext
-            };
-
-            if self.translit_mode == TranslitMode::RuToLat {
-                ext_val = transliterate_ru_to_lat(&ext_val);
-            }
-
-            ext_val = match self.ext_mode {
-                ExtMode::Keep => ext_val,
-                ExtMode::Lower => ext_val.to_lowercase(),
-                ExtMode::Upper => ext_val.to_uppercase(),
-                ExtMode::Remove => String::new(),
-            };
-
-            if ext_val.is_empty() {
-                String::new()
-            } else {
-                format!(".{}", ext_val)
-            }
-        };
-
-        format!("{}{}", stem, final_ext)
-    }
-
     fn recalculate_preview(&mut self) {
-        let allowed_exts: Vec<String> = self
-            .ext_filter
-            .split(',')
-            .map(|s| s.trim().trim_start_matches('.').to_lowercase())
-            .filter(|s| !s.is_empty())
-            .collect();
-
-        let excluded_exts: Vec<String> = self
-            .ext_exclude_filter
-            .split(',')
-            .map(|s| s.trim().trim_start_matches('.').to_lowercase())
-            .filter(|s| !s.is_empty())
-            .collect();
-
-        let excluded_words: Vec<String> = self
-            .exclude_words_filter
-            .split(',')
-            .map(|s| s.trim().to_lowercase())
-            .filter(|s| !s.is_empty())
-            .collect();
-
-        let search_trimmed = self.search_query.trim();
-        let search_re = if !search_trimmed.is_empty() {
-            let pat = if self.search_regex {
-                search_trimmed.to_string()
-            } else {
-                regex::escape(search_trimmed)
-            };
-            RegexBuilder::new(&pat)
-                .case_insensitive(!self.search_case_sensitive)
-                .build()
-                .ok()
-        } else {
-            None
-        };
-
-        let mut filtered: Vec<&FsEntry> = self
-            .all_entries
-            .iter()
-            .filter(|e| {
-                if self.hide_system_hidden && e.is_hidden {
-                    return false;
-                }
-                if e.is_dir && !self.include_dirs {
-                    return false;
-                }
-                if !e.is_dir && !self.include_files {
-                    return false;
-                }
-
-                if !search_trimmed.is_empty() {
-                    if let Some(re) = &search_re {
-                        if !re.is_match(&e.name) {
-                            return false;
-                        }
-                    } else {
-                        return false;
-                    }
-                }
-
-                if !excluded_words.is_empty() {
-                    let name_low = e.name.to_lowercase();
-                    if excluded_words.iter().any(|w| name_low.contains(w)) {
-                        return false;
-                    }
-                }
-
-                if !allowed_exts.is_empty() {
-                    if e.is_dir || !allowed_exts.contains(&e.ext_lower) {
-                        return false;
-                    }
-                }
-                if !excluded_exts.is_empty() && !e.is_dir && excluded_exts.contains(&e.ext_lower) {
-                    return false;
-                }
-
-                if !e.is_dir {
-                    let min_b = self.size_min_kb.saturating_mul(1024);
-                    let max_b = self.size_max_kb.saturating_mul(1024);
-                    match self.size_filter_mode {
-                        SizeFilterMode::Any => {}
-                        SizeFilterMode::GreaterThanKB => {
-                            if e.size < min_b {
-                                return false;
-                            }
-                        }
-                        SizeFilterMode::LessThanKB => {
-                            if e.size > max_b {
-                                return false;
-                            }
-                        }
-                        SizeFilterMode::BetweenKB => {
-                            if e.size < min_b || e.size > max_b {
-                                return false;
-                            }
-                        }
-                    }
-                }
-
-                true
-            })
-            .collect();
-
-        filtered.sort_by(|a, b| self.compare_entries(a, b));
-
-        let custom_lines: Vec<&str> = if self.use_custom_list {
-            self.custom_list_raw
-                .lines()
-                .map(|l| l.trim())
-                .filter(|l| !l.is_empty())
-                .collect()
-        } else {
-            Vec::new()
-        };
-
-        self.preview_rows.clear();
-        let mut changed_count = 0;
-        let mut included_count = 0;
-        let mut dir_counters: std::collections::HashMap<PathBuf, usize> =
-            std::collections::HashMap::new();
-        let mut global_counter: usize = 0;
-
-        for entry in filtered {
-            let included = !self.excluded_paths.contains(&entry.path);
-            let old_name = entry.name.clone();
-
-            let new_name = if included {
-                let list_override = if self.use_custom_list {
-                    custom_lines.get(global_counter).copied()
-                } else {
-                    None
-                };
-
-                let idx = if self.reset_num_per_dir {
-                    let c = dir_counters.entry(entry.parent_dir.clone()).or_insert(0);
-                    let current = *c;
-                    *c += 1;
-                    current
-                } else {
-                    global_counter
-                };
-                global_counter += 1;
-                self.compute_new_name(entry, idx, list_override)
-            } else {
-                old_name.clone()
-            };
-
-            let changed = included && old_name != new_name && !new_name.is_empty();
-
-            let pass_status = match self.status_filter {
-                StatusFilter::All => true,
-                StatusFilter::OnlyChanged => changed,
-                StatusFilter::OnlyIncluded => included,
-                StatusFilter::OnlyUnchanged => !changed,
-            };
-
-            if !pass_status {
-                continue;
-            }
-
-            if included {
-                included_count += 1;
-            }
-            if changed {
-                changed_count += 1;
-            }
-
-            let is_video = !entry.is_dir && media_info::is_video_ext(&entry.ext_lower);
-
-            self.preview_rows.push(PreviewRow {
-                old_path: entry.path.clone(),
-                parent_dir: entry.parent_dir.clone(),
-                rel_parent: entry.rel_parent.clone(),
-                is_dir: entry.is_dir,
-                is_video,
-                depth: entry.depth,
-                size: entry.size,
-                modified_ts: entry.modified_ts,
-                old_name,
-                new_name,
-                included,
-                changed,
-            });
-        }
+        let cfg = self.to_rename_config();
+        let summary = compute_preview(
+            self.current_dir.as_deref(),
+            &self.all_entries,
+            &self.excluded_paths,
+            &self.manual_overrides,
+            &cfg,
+            &mut self.hash_cache,
+        );
+        self.preview_rows = summary.rows;
+        self.issue_count = summary.issue_count;
 
         self.status_msg = match self.lang {
             Lang::Ru => format!(
-                "Показано: {} (из {})  •  Выбрано: {}  •  К переименованию: {}",
+                "Показано: {} (из {})  •  Выбрано: {}  •  К переименованию: {}{}",
                 self.preview_rows.len(),
                 self.all_entries.len(),
-                included_count,
-                changed_count
+                summary.included_count,
+                summary.changed_count,
+                if summary.issue_count > 0 {
+                    format!("  •  ⚠ Конфликты: {}", summary.issue_count)
+                } else {
+                    String::new()
+                }
             ),
             Lang::En => format!(
-                "Shown: {} (of {})  •  Selected: {}  •  Ready to rename: {}",
+                "Shown: {} (of {})  •  Selected: {}  •  Ready to rename: {}{}",
                 self.preview_rows.len(),
                 self.all_entries.len(),
-                included_count,
-                changed_count
+                summary.included_count,
+                summary.changed_count,
+                if summary.issue_count > 0 {
+                    format!("  •  ⚠ Issues: {}", summary.issue_count)
+                } else {
+                    String::new()
+                }
             ),
         };
     }
@@ -2102,6 +1489,8 @@ impl ReStemApp {
         self.replace_str.clear();
         self.use_regex = false;
         self.case_sensitive = true;
+        self.extra_replaces.clear();
+        self.rule_order = default_rule_order();
         self.case_mode = CaseMode::None;
         self.translit_mode = TranslitMode::None;
         self.sanitize_names = false;
@@ -2125,108 +1514,64 @@ impl ReStemApp {
         self.exclude_words_filter.clear();
         self.size_filter_mode = SizeFilterMode::Any;
         self.status_filter = StatusFilter::All;
+        self.auto_suffix_duplicates = false;
+        self.sync_sidecars = false;
+        self.organize_enabled = false;
+        self.organize_template.clear();
+        self.manual_overrides.clear();
+        self.editing_row_path = None;
         self.recalculate_preview();
     }
 
-    fn apply_rename(&mut self) {
-        let mut seen: HashSet<(PathBuf, String)> = HashSet::new();
-        for row in &self.preview_rows {
-            let final_name = if row.included {
-                &row.new_name
-            } else {
-                &row.old_name
-            };
-            let key = (row.parent_dir.clone(), final_name.to_lowercase());
-            if !seen.insert(key) {
+    fn apply_rename(&mut self, ctx: &egui::Context) {
+        match execute_rename_batch(&self.preview_rows, self.lang) {
+            Ok(batch) => {
+                let count = batch.moves.len();
+                if count > 0 {
+                    if self.undo_stack.len() >= 20 {
+                        self.undo_stack.remove(0);
+                    }
+                    self.undo_stack.push(batch);
+                }
+                self.manual_overrides.clear();
+                self.editing_row_path = None;
+                if let Some(dir) = self.current_dir.clone() {
+                    self.load_directory(dir, ctx);
+                }
                 self.status_msg = match self.lang {
-                    Lang::Ru => format!(
-                        "Ошибка: дубликат имени '{}' в '{}'",
-                        final_name, row.rel_parent
-                    ),
-                    Lang::En => format!(
-                        "Error: duplicate name '{}' in '{}'",
-                        final_name, row.rel_parent
-                    ),
+                    Lang::Ru => format!("Успешно переименовано объектов: {}", count),
+                    Lang::En => format!("Successfully renamed items: {}", count),
                 };
-                return;
+            }
+            Err(err) => {
+                self.status_msg = err;
             }
         }
-
-        let mut to_rename: Vec<PreviewRow> = self
-            .preview_rows
-            .iter()
-            .filter(|r| r.included && r.changed)
-            .cloned()
-            .collect();
-
-        to_rename.sort_by(|a, b| {
-            b.depth
-                .cmp(&a.depth)
-                .then_with(|| a.is_dir.cmp(&b.is_dir))
-        });
-
-        let mut batch_history = Vec::new();
-        for row in to_rename {
-            let new_path = row.old_path.with_file_name(&row.new_name);
-            let same_file_case_change =
-                row.old_name.to_lowercase() == row.new_name.to_lowercase();
-
-            if new_path.exists() && !same_file_case_change {
-                self.status_msg = match self.lang {
-                    Lang::Ru => format!("Ошибка: '{}' уже существует", row.new_name),
-                    Lang::En => format!("Error: '{}' already exists", row.new_name),
-                };
-                break;
-            }
-
-            if let Err(e) = fs::rename(&row.old_path, &new_path) {
-                self.status_msg = format!("Error {}: {}", row.old_name, e);
-                break;
-            }
-            batch_history.push((new_path, row.old_path));
-        }
-
-        let count = batch_history.len();
-        if count > 0 {
-            if self.undo_stack.len() >= 20 {
-                self.undo_stack.remove(0);
-            }
-            self.undo_stack.push(batch_history);
-        }
-
-        if let Some(dir) = self.current_dir.clone() {
-            self.load_directory(dir);
-        }
-        self.status_msg = match self.lang {
-            Lang::Ru => format!("Успешно переименовано объектов: {}", count),
-            Lang::En => format!("Successfully renamed items: {}", count),
-        };
     }
 
-    fn undo_rename(&mut self) {
+    fn undo_rename(&mut self, ctx: &egui::Context) {
         let Some(last_batch) = self.undo_stack.pop() else {
             return;
         };
-        let mut restored = 0;
-        for (curr, orig) in last_batch.into_iter().rev() {
-            if fs::rename(&curr, &orig).is_ok() {
-                restored += 1;
-            }
-        }
+        let (restored, err) = execute_undo_batch(last_batch);
         if let Some(dir) = self.current_dir.clone() {
-            self.load_directory(dir);
+            self.load_directory(dir, ctx);
         }
-        self.status_msg = match self.lang {
-            Lang::Ru => format!(
-                "Откат выполнен: возвращено {} имён (осталось шагов в истории: {})",
-                restored,
-                self.undo_stack.len()
-            ),
-            Lang::En => format!(
-                "Undo complete: restored {} names ({} steps left in history)",
-                restored,
-                self.undo_stack.len()
-            ),
+        self.status_msg = if let Some(e) = err {
+            format!("Undo partial ({}): {}", restored, e)
+        } else {
+            match self.lang {
+                Lang::Ru => format!(
+                    "Откат выполнен: возвращено {} имён (осталось шагов в истории: {})",
+                    restored,
+                    self.undo_stack.len()
+                ),
+                Lang::En => format!(
+                    "Undo complete: restored {} names ({} steps left in history)",
+                    restored,
+                    self.undo_stack.len()
+                ),
+            }
         };
     }
 
@@ -2244,12 +1589,12 @@ impl ReStemApp {
             if i.modifiers.ctrl && i.key_pressed(egui::Key::Z) && !wants_kb {
                 trig_undo = true;
             }
-            if i.modifiers.ctrl && i.key_pressed(egui::Key::Enter) {
+            if i.modifiers.ctrl && i.key_pressed(egui::Key::Enter) && !wants_kb {
                 trig_apply = true;
             }
             if i.modifiers.ctrl && i.key_pressed(egui::Key::O) {
                 if let Some(folder) = rfd::FileDialog::new().pick_folder() {
-                    self.open_new_directory(folder);
+                    self.open_new_directory(folder, ctx);
                 }
             }
             if i.key_pressed(egui::Key::Delete) && !wants_kb {
@@ -2274,7 +1619,7 @@ impl ReStemApp {
                 };
 
                 if let Some(dir) = target_dir {
-                    self.open_new_directory(dir);
+                    self.open_new_directory(dir, ctx);
                 }
             }
         }
@@ -2302,8 +1647,49 @@ impl ReStemApp {
     }
 }
 
+fn render_photo_meta_lines(ui: &mut egui::Ui, meta: &photo_meta::PhotoMeta, lang: Lang) {
+    if let Some((w, h)) = meta.dimensions() {
+        ui.label(format!("{} × {} px", w, h));
+    }
+    let mut line1 = Vec::new();
+    if let Some(d) = &meta.exif_date {
+        let dt = if let Some(t) = &meta.exif_time {
+            format!("{} {}", d, t)
+        } else {
+            d.clone()
+        };
+        line1.push(format!("📅 {}", dt));
+    }
+    if let Some(c) = &meta.camera {
+        line1.push(format!("📷 {}", c));
+    }
+    if !line1.is_empty() {
+        ui.weak(line1.join("  •  "));
+    }
+    let mut line2 = Vec::new();
+    if let Some(l) = &meta.lens {
+        line2.push(format!("🔭 {}", l));
+    }
+    if let Some(iso) = meta.iso_tag() {
+        line2.push(iso);
+    }
+    if let Some(ap) = meta.aperture_tag() {
+        line2.push(ap);
+    }
+    if let Some(sh) = meta.shutter_display() {
+        line2.push(sh);
+    }
+    if !line2.is_empty() {
+        ui.weak(line2.join("  •  "));
+    }
+    if !meta.has_exif() && meta.dimensions().is_none() {
+        ui.weak(lang.tr("EXIF-теги не найдены.", "No EXIF metadata found."));
+    }
+}
+
 impl eframe::App for ReStemApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.poll_background_tasks(ctx);
         self.handle_drag_and_drop(ctx);
         let (kb_reload, kb_undo, kb_apply) = self.handle_keyboard_shortcuts(ctx);
 
@@ -2320,6 +1706,8 @@ impl eframe::App for ReStemApp {
         let mut open_sys_target: Option<PathBuf> = None;
         let mut single_trash_target: Option<PathBuf> = None;
         let mut settings_dirty = false;
+        let mut trigger_update_check_now = false;
+        let mut trigger_dup_scan = false;
 
         let checked_count = self.preview_rows.iter().filter(|r| r.included).count();
         let ready_to_rename_count = self
@@ -2327,6 +1715,7 @@ impl eframe::App for ReStemApp {
             .iter()
             .filter(|r| r.included && r.changed)
             .count();
+        let can_apply_now = ready_to_rename_count > 0 && self.issue_count == 0;
 
         // --- МОДАЛЬНОЕ ОКНО: ШПАРГАЛКА REGEX ---
         if self.show_regex_help_modal {
@@ -2346,17 +1735,26 @@ impl eframe::App for ReStemApp {
 
                     let templates = [
                         (
-                            lang.tr("Убрать номер копии в скобках: « (1)», « (2)»", "Remove copy numbers: ' (1)', ' (2)'"),
+                            lang.tr(
+                                "Убрать номер копии в скобках: « (1)», « (2)»",
+                                "Remove copy numbers: ' (1)', ' (2)'",
+                            ),
                             r"\s*\(\d+\)",
                             "",
                         ),
                         (
-                            lang.tr("Убрать текст в квадратных скобках [тег]", "Remove bracketed tags [tag]"),
+                            lang.tr(
+                                "Убрать текст в квадратных скобках [тег]",
+                                "Remove bracketed tags [tag]",
+                            ),
                             r"\s*\[[^\]]*\]",
                             "",
                         ),
                         (
-                            lang.tr("Переставить дату ДД.ММ.ГГГГ → ГГГГ-ММ-ДД", "Swap date DD.MM.YYYY → YYYY-MM-DD"),
+                            lang.tr(
+                                "Переставить дату ДД.ММ.ГГГГ → ГГГГ-ММ-ДД",
+                                "Swap date DD.MM.YYYY → YYYY-MM-DD",
+                            ),
                             r"(\d{2})\.(\d{2})\.(\d{4})",
                             "$3-$2-$1",
                         ),
@@ -2371,7 +1769,10 @@ impl eframe::App for ReStemApp {
                             "",
                         ),
                         (
-                            lang.tr("Поменять местами 2 слова через дефис (А-Б → Б-А)", "Swap two hyphenated words (A-B → B-A)"),
+                            lang.tr(
+                                "Поменять местами 2 слова через дефис (А-Б → Б-А)",
+                                "Swap two hyphenated words (A-B → B-A)",
+                            ),
                             r"^([^-]+)-(.+)$",
                             "$2-$1",
                         ),
@@ -2460,7 +1861,178 @@ impl eframe::App for ReStemApp {
             }
         }
 
-        // --- МОДАЛЬНОЕ ОКНО «О ПРОГРАММЕ» + GITHUB И КОНТЕКСТНОЕ МЕНЮ ---
+        // --- МОДАЛЬНОЕ ОКНО: ПОИСК ДУБЛИКАТОВ ---
+        if self.show_duplicates_modal {
+            let mut open = true;
+            let mut trash_dups_now = false;
+
+            egui::Window::new(lang.tr("🧬 Поиск дубликатов файлов", "🧬 Duplicate File Finder"))
+                .collapsible(false)
+                .resizable(true)
+                .default_width(600.0)
+                .default_height(430.0)
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .open(&mut open)
+                .show(ctx, |ui| {
+                    ui.horizontal_wrapped(|ui| {
+                        if !self.dup_scanning {
+                            if ui
+                                .add_enabled(
+                                    !self.all_entries.is_empty(),
+                                    egui::Button::new(lang.tr(
+                                        "🔍 Сканировать дубликаты (Размер + SHA-256)",
+                                        "🔍 Scan for Duplicates (Size + SHA-256)",
+                                    )),
+                                )
+                                .clicked()
+                            {
+                                trigger_dup_scan = true;
+                            }
+                        } else if ui.button(lang.tr("✖ Отмена", "✖ Cancel")).clicked() {
+                            if let Some(c) = &self.dup_cancel {
+                                c.store(true, Ordering::Relaxed);
+                            }
+                        }
+
+                        if !self.dup_groups.is_empty() {
+                            if ui
+                                .button(lang.tr(
+                                    "☑ Отметить копии (оставить по 1)",
+                                    "☑ Select copies (keep 1st)",
+                                ))
+                                .clicked()
+                            {
+                                self.dup_checked.clear();
+                                for g in &self.dup_groups {
+                                    for p in g.paths.iter().skip(1) {
+                                        self.dup_checked.insert(p.clone());
+                                    }
+                                }
+                            }
+                            if ui.button(lang.tr("🧹 Снять отметки", "🧹 Clear selection")).clicked()
+                            {
+                                self.dup_checked.clear();
+                            }
+                        }
+                    });
+
+                    if self.dup_scanning {
+                        let (done, total) = self.dup_progress;
+                        let frac = if total > 0 {
+                            done as f32 / total as f32
+                        } else {
+                            0.0
+                        };
+                        ui.add(
+                            egui::ProgressBar::new(frac).text(format!(
+                                "{} {}/{}",
+                                lang.tr("Проверка файлов:", "Checking files:"),
+                                done,
+                                total
+                            )),
+                        );
+                    }
+
+                    ui.separator();
+
+                    if self.dup_groups.is_empty() && !self.dup_scanning {
+                        ui.weak(lang.tr(
+                            "Дубликаты не найдены или сканирование ещё не запускалось.",
+                            "No duplicates found yet, or scan has not been run.",
+                        ));
+                    } else if !self.dup_groups.is_empty() {
+                        let total_waste: u64 = self
+                            .dup_groups
+                            .iter()
+                            .map(|g| g.file_size.saturating_mul((g.paths.len() - 1) as u64))
+                            .sum();
+                        ui.strong(match lang {
+                            Lang::Ru => format!(
+                                "Найдено групп: {}  •  Лишний объём: {}",
+                                self.dup_groups.len(),
+                                Self::format_size(total_waste, false)
+                            ),
+                            Lang::En => format!(
+                                "Duplicate groups: {}  •  Wasted space: {}",
+                                self.dup_groups.len(),
+                                Self::format_size(total_waste, false)
+                            ),
+                        });
+
+                        egui::ScrollArea::vertical()
+                            .id_salt("dup_groups_scroll")
+                            .max_height(260.0)
+                            .show(ui, |ui| {
+                                for (idx, g) in self.dup_groups.iter().enumerate() {
+                                    card_frame(is_dark).show(ui, |ui| {
+                                        ui.set_min_width(ui.available_width());
+                                        ui.strong(format!(
+                                            "#{} • {} • {} {} • SHA256:{}",
+                                            idx + 1,
+                                            Self::format_size(g.file_size, false),
+                                            g.paths.len(),
+                                            lang.tr("файла(ов)", "files"),
+                                            &g.sha256[..8.min(g.sha256.len())]
+                                        ));
+                                        for p in &g.paths {
+                                            let mut is_chk = self.dup_checked.contains(p);
+                                            let disp = if let Some(root) = &self.current_dir {
+                                                p.strip_prefix(root)
+                                                    .map(|rp| rp.display().to_string())
+                                                    .unwrap_or_else(|_| p.display().to_string())
+                                            } else {
+                                                p.display().to_string()
+                                            };
+                                            if ui.checkbox(&mut is_chk, disp).changed() {
+                                                if is_chk {
+                                                    self.dup_checked.insert(p.clone());
+                                                } else {
+                                                    self.dup_checked.remove(p);
+                                                }
+                                            }
+                                        }
+                                    });
+                                    ui.add_space(4.0);
+                                }
+                            });
+
+                        ui.add_space(6.0);
+                        let del_cnt = self.dup_checked.len();
+                        let del_lbl = match lang {
+                            Lang::Ru => format!("🗑 В корзину выбранные копии ({})", del_cnt),
+                            Lang::En => format!("🗑 Move selected copies to Trash ({})", del_cnt),
+                        };
+                        let btn = egui::Button::new(
+                            egui::RichText::new(del_lbl).color(egui::Color32::WHITE),
+                        )
+                        .fill(if del_cnt > 0 {
+                            egui::Color32::from_rgb(205, 55, 55)
+                        } else {
+                            egui::Color32::from_gray(95)
+                        });
+                        if ui.add_enabled(del_cnt > 0, btn).clicked() {
+                            trash_dups_now = true;
+                        }
+                    }
+                });
+
+            if trash_dups_now {
+                let targets: Vec<PathBuf> = self.dup_checked.iter().cloned().collect();
+                for p in &targets {
+                    self.dup_checked.remove(p);
+                    for g in &mut self.dup_groups {
+                        g.paths.retain(|gp| gp != p);
+                    }
+                }
+                self.dup_groups.retain(|g| g.paths.len() >= 2);
+                self.delete_paths_to_trash(targets, ctx);
+            }
+            if !open {
+                self.show_duplicates_modal = false;
+            }
+        }
+
+        // --- МОДАЛЬНОЕ ОКНО «О ПРОГРАММЕ» ---
         if self.show_about_modal {
             let mut open = true;
             let mut close_about = false;
@@ -2469,7 +2041,7 @@ impl eframe::App for ReStemApp {
             egui::Window::new(lang.tr("ℹ О программе ReStem", "ℹ About ReStem"))
                 .collapsible(false)
                 .resizable(false)
-                .default_width(425.0)
+                .default_width(450.0)
                 .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
                 .open(&mut open)
                 .show(ctx, |ui| {
@@ -2507,43 +2079,43 @@ impl eframe::App for ReStemApp {
 
                     ui.add_space(8.0);
                     card_frame(is_dark).show(ui, |ui| {
-                        ui.set_min_width(385.0);
+                        ui.set_min_width(410.0);
                         ui.label(lang.tr(
-                            "• Рекурсивное переименование файлов и каталогов\n\
-                             • Умные теги {date}, {exif_date}, {camera}, {parent}, {w}x{h}\n\
-                             • Видео-теги MediaInfo: {res}, {vcodec}, {acodec}, {ach}, {fps}, {duration}, {bitrate}, {hdr}, {media_date}\n\
-                             • Посимвольная Diff-подсветка, Regex и транслит (RU ↔ LAT)\n\
-                             • Предпросмотр картинок, MediaInfo видео и текста, удаление в Корзину\n\
-                             • Многошаговый откат (Ctrl+Z) и экспорт скрипта .bat",
-                            "• Recursive file and folder batch renaming\n\
-                             • Smart tags {date}, {exif_date}, {camera}, {parent}, {w}x{h}\n\
-                             • Video MediaInfo tags: {res}, {vcodec}, {acodec}, {ach}, {fps}, {duration}, {bitrate}, {hdr}, {media_date}\n\
-                             • Inline character Diff, Regex & Transliteration (RU ↔ LAT)\n\
-                             • Image, Video MediaInfo & text preview; safe Recycle Bin deletion\n\
-                             • Multi-step Undo (Ctrl+Z) & .bat rollback export",
+                            "• Рекурсивный асинхронный скан + раскладка в подпапки по шаблону\n\
+                             • Фото EXIF (JPEG/HEIC/WebP/PNG/RAW): {exif_date}, {exif_time}, {camera}, {lens}, {iso}, {aperture}, {shutter}\n\
+                             • Видео MediaInfo: {res}, {vcodec}, {acodec}, {ach}, {fps}, {duration}, {bitrate}, {hdr}, {media_date}\n\
+                             • Аудио-теги (ID3/FLAC/OGG/M4A/WAV): {artist}, {album}, {title}, {track}, {audio_year}, {genre}\n\
+                             • Хеши {crc32}, {sha256_8}, {size}; парные файлы (.srt/.xmp); поиск дубликатов\n\
+                             • Настройка порядка правил (Pipeline), ручная правка строк, пресеты JSON и CLI-режим",
+                            "• Async recursive scan & template subfolder organization\n\
+                             • Photo EXIF (JPEG/HEIC/WebP/PNG/RAW): {exif_date}, {exif_time}, {camera}, {lens}, {iso}, {aperture}, {shutter}\n\
+                             • Video MediaInfo: {res}, {vcodec}, {acodec}, {ach}, {fps}, {duration}, {bitrate}, {hdr}, {media_date}\n\
+                             • Audio tags (ID3/FLAC/OGG/M4A/WAV): {artist}, {album}, {title}, {track}, {audio_year}, {genre}\n\
+                             • Hashes {crc32}, {sha256_8}, {size}; sidecar sync (.srt/.xmp); duplicate finder\n\
+                             • Custom rule pipeline order, inline row edit, JSON presets & CLI automation",
                         ));
 
                         ui.separator();
                         ui.strong(lang.tr(
-                            "Официальный репозиторий GitHub:",
-                            "Official GitHub Repository:",
+                            "Официальный репозиторий GitHub и обновления:",
+                            "Official GitHub Repository & Updates:",
                         ));
                         ui.weak(GITHUB_REPO_URL);
                         ui.horizontal_wrapped(|ui| {
                             if ui
-                                .button(lang.tr(
-                                    "🌐 Открыть GitHub",
-                                    "🌐 Open GitHub Repo",
-                                ))
+                                .button(lang.tr("🌐 Открыть GitHub", "🌐 Open GitHub Repo"))
                                 .clicked()
                             {
                                 open_url_in_browser(GITHUB_REPO_URL);
                             }
                             if ui
-                                .button(lang.tr(
-                                    "⬇ Проверить обновления (Releases)",
-                                    "⬇ Check Releases",
-                                ))
+                                .button(lang.tr("🔄 Проверить обновления", "🔄 Check Updates"))
+                                .clicked()
+                            {
+                                trigger_update_check_now = true;
+                            }
+                            if ui
+                                .button(lang.tr("⬇ Страница Releases", "⬇ Releases Page"))
                                 .clicked()
                             {
                                 let rel_url = format!(
@@ -2553,6 +2125,53 @@ impl eframe::App for ReStemApp {
                                 open_url_in_browser(&rel_url);
                             }
                         });
+
+                        if ui
+                            .checkbox(
+                                &mut self.check_updates,
+                                lang.tr(
+                                    "Проверять обновления при запуске программы",
+                                    "Check for updates on startup",
+                                ),
+                            )
+                            .changed()
+                        {
+                            settings_dirty = true;
+                        }
+
+                        match &self.update_state {
+                            UpdateCheckState::Checking => {
+                                ui.weak(lang.tr("Проверка обновлений...", "Checking for updates..."));
+                            }
+                            UpdateCheckState::UpToDate => {
+                                ui.colored_label(
+                                    egui::Color32::from_rgb(24, 150, 105),
+                                    lang.tr("✔ Установлена актуальная версия.", "✔ You are up to date."),
+                                );
+                            }
+                            UpdateCheckState::Available(info) => {
+                                ui.horizontal_wrapped(|ui| {
+                                    ui.colored_label(
+                                        egui::Color32::from_rgb(35, 190, 115),
+                                        format!(
+                                            "{} v{}",
+                                            lang.tr("Доступна новая версия:", "New version available:"),
+                                            info.latest_version
+                                        ),
+                                    );
+                                    if ui.small_button(lang.tr("Скачать", "Download")).clicked() {
+                                        open_url_in_browser(&info.release_url);
+                                    }
+                                });
+                            }
+                            UpdateCheckState::Failed => {
+                                ui.weak(lang.tr(
+                                    "Не удалось проверить обновления.",
+                                    "Failed to check for updates.",
+                                ));
+                            }
+                            UpdateCheckState::Idle => {}
+                        }
 
                         ui.separator();
                         ui.strong(lang.tr(
@@ -2577,6 +2196,10 @@ impl eframe::App for ReStemApp {
                             }
                         });
                         ui.separator();
+                        ui.weak(lang.tr(
+                            "CLI: restem <ПАПКА> --preset <ИМЯ> [--dry-run | --apply]",
+                            "CLI: restem <DIR> --preset <NAME> [--dry-run | --apply]",
+                        ));
                         ui.horizontal_wrapped(|ui| {
                             ui.weak(lang.tr("Горячие клавиши:", "Shortcuts:"));
                             ui.label("Ctrl+O • F5 • Ctrl+Z • Del • Ctrl+Enter");
@@ -2666,383 +2289,244 @@ impl eframe::App for ReStemApp {
                     .map(|r| r.old_path.clone())
                     .collect();
                 self.confirm_trash_modal = false;
-                self.delete_paths_to_trash(targets);
+                self.delete_paths_to_trash(targets, ctx);
             } else if close_now || !open {
                 self.confirm_trash_modal = false;
             }
         }
 
-        // --- ВЕРХНЯЯ ПАНЕЛЬ ИНСТРУМЕНТОВ (АДАПТИВНАЯ БЕЗ НАЛОЖЕНИЯ БЛОКОВ) ---
+        // --- ВЕРХНЯЯ ПАНЕЛЬ ИНСТРУМЕНТОВ ---
         egui::TopBottomPanel::top("top_toolbar").show(ctx, |ui| {
             ui.add_space(4.0);
-            let total_top_width = ui.available_width();
+            ui.horizontal_wrapped(|ui| {
+                let (rect, _) =
+                    ui.allocate_exact_size(egui::vec2(26.0, 26.0), egui::Sense::hover());
+                ui.painter()
+                    .rect_filled(rect, 6.0, egui::Color32::from_rgb(20, 30, 48));
+                ui.painter().text(
+                    rect.center(),
+                    egui::Align2::CENTER_CENTER,
+                    "R",
+                    egui::FontId::proportional(17.0),
+                    egui::Color32::from_rgb(35, 205, 175),
+                );
+                ui.strong(egui::RichText::new("ReStem").size(17.0));
+                ui.weak(format!("v{}", APP_VERSION));
 
-            // Ряд 1: На широком экране (>= 1050 pt) разносим по краям, а на узком или при крупном шрифте — включаем плавный автоперенос
-            if total_top_width >= 1050.0 {
-                ui.horizontal(|ui| {
-                    let (rect, _) =
-                        ui.allocate_exact_size(egui::vec2(26.0, 26.0), egui::Sense::hover());
-                    ui.painter()
-                        .rect_filled(rect, 6.0, egui::Color32::from_rgb(20, 30, 48));
-                    ui.painter().text(
-                        rect.center(),
-                        egui::Align2::CENTER_CENTER,
-                        "R",
-                        egui::FontId::proportional(17.0),
-                        egui::Color32::from_rgb(35, 205, 175),
-                    );
-                    ui.strong(egui::RichText::new("ReStem").size(17.0));
-                    ui.weak(format!("v{}", APP_VERSION));
-                    ui.separator();
-
-                    if ui
-                        .button(lang.tr("📁 Папка...", "📁 Folder..."))
-                        .on_hover_text("Ctrl+O")
-                        .clicked()
-                    {
-                        if let Some(folder) = rfd::FileDialog::new().pick_folder() {
-                            navigate_to = Some(folder);
-                        }
-                    }
-
-                    if ui
-                        .button(lang.tr("🔄 Обновить", "🔄 Refresh"))
-                        .on_hover_text("F5")
-                        .clicked()
-                    {
-                        needs_reload = true;
-                    }
-
-                    if ui
-                        .button(lang.tr("☑ Инверт.", "☑ Invert"))
-                        .clicked()
-                    {
-                        for row in &self.preview_rows {
-                            if self.excluded_paths.contains(&row.old_path) {
-                                self.excluded_paths.remove(&row.old_path);
-                            } else {
-                                self.excluded_paths.insert(row.old_path.clone());
-                            }
-                        }
-                        needs_recalc = true;
-                    }
-
-                    let top_apply_label = match lang {
-                        Lang::Ru => format!("✔ Применить ({})", ready_to_rename_count),
-                        Lang::En => format!("✔ Apply ({})", ready_to_rename_count),
-                    };
-                    let top_apply_fill = if ready_to_rename_count > 0 {
-                        egui::Color32::from_rgb(16, 148, 92)
-                    } else if is_dark {
-                        egui::Color32::from_rgb(42, 48, 60)
-                    } else {
-                        egui::Color32::from_rgb(210, 216, 226)
-                    };
-                    let top_apply_fg = if ready_to_rename_count > 0 {
-                        egui::Color32::WHITE
-                    } else if is_dark {
-                        egui::Color32::from_gray(160)
-                    } else {
-                        egui::Color32::from_gray(105)
-                    };
-                    let top_apply_btn = egui::Button::new(
-                        egui::RichText::new(top_apply_label)
-                            .color(top_apply_fg)
+                if let UpdateCheckState::Available(info) = &self.update_state {
+                    let upd_btn = egui::Button::new(
+                        egui::RichText::new(format!("⬆ v{}", info.latest_version))
+                            .color(egui::Color32::WHITE)
                             .strong(),
                     )
-                    .fill(top_apply_fill);
-
+                    .fill(egui::Color32::from_rgb(16, 150, 92));
                     if ui
-                        .add_enabled(ready_to_rename_count > 0, top_apply_btn)
-                        .on_hover_text("Ctrl+Enter")
-                        .clicked()
-                    {
-                        trigger_apply = true;
-                    }
-
-                    let undo_label = match lang {
-                        Lang::Ru => format!("↺ Откат ({})", self.undo_stack.len()),
-                        Lang::En => format!("↺ Undo ({})", self.undo_stack.len()),
-                    };
-                    if ui
-                        .add_enabled(!self.undo_stack.is_empty(), egui::Button::new(undo_label))
-                        .on_hover_text("Ctrl+Z")
-                        .clicked()
-                    {
-                        trigger_undo = true;
-                    }
-
-                    if ui
-                        .add_enabled(
-                            !self.undo_stack.is_empty(),
-                            egui::Button::new(lang.tr("💾 .bat", "💾 .bat")),
-                        )
+                        .add(upd_btn)
                         .on_hover_text(lang.tr(
-                            "Экспортировать .bat-скрипт для отката",
-                            "Export .bat rollback script",
+                            "Доступна новая версия на GitHub — нажмите для скачивания",
+                            "New release available on GitHub — click to download",
                         ))
                         .clicked()
                     {
-                        self.export_rollback_script();
+                        open_url_in_browser(&info.release_url);
                     }
+                }
 
-                    let trash_label = match lang {
-                        Lang::Ru => format!("🗑 В корзину ({})", checked_count),
-                        Lang::En => format!("🗑 Trash ({})", checked_count),
-                    };
-                    if ui
-                        .add_enabled(checked_count > 0, egui::Button::new(trash_label))
-                        .on_hover_text("Delete")
-                        .clicked()
-                    {
-                        self.confirm_trash_modal = true;
+                ui.separator();
+
+                if ui
+                    .button(lang.tr("📁 Папка...", "📁 Folder..."))
+                    .on_hover_text("Ctrl+O")
+                    .clicked()
+                {
+                    if let Some(folder) = rfd::FileDialog::new().pick_folder() {
+                        navigate_to = Some(folder);
                     }
+                }
 
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui
-                            .button(lang.tr("ℹ О программе", "ℹ About"))
-                            .clicked()
-                        {
-                            self.show_about_modal = true;
-                        }
+                if ui
+                    .button(lang.tr("🔄 Обновить", "🔄 Refresh"))
+                    .on_hover_text("F5")
+                    .clicked()
+                {
+                    needs_reload = true;
+                }
 
-                        if ui
-                            .button("🌐 GitHub")
-                            .on_hover_text(GITHUB_REPO_URL)
-                            .clicked()
-                        {
-                            open_url_in_browser(GITHUB_REPO_URL);
-                        }
-
-                        ui.separator();
-
-                        if ui.selectable_label(self.lang == Lang::En, "EN").clicked() {
-                            self.lang = Lang::En;
-                            settings_dirty = true;
-                            needs_recalc = true;
-                        }
-                        if ui.selectable_label(self.lang == Lang::Ru, "RU").clicked() {
-                            self.lang = Lang::Ru;
-                            settings_dirty = true;
-                            needs_recalc = true;
-                        }
-
-                        ui.separator();
-
-                        if ui
-                            .small_button("A+")
-                            .on_hover_text(lang.tr("Увеличить масштаб", "Zoom In"))
-                            .clicked()
-                        {
-                            self.ui_scale = (self.ui_scale + 0.1).min(1.5);
-                            ctx.set_pixels_per_point(self.ui_scale);
-                            settings_dirty = true;
-                        }
-                        if ui
-                            .small_button(format!("{:.0}%", self.ui_scale * 100.0))
-                            .on_hover_text(lang.tr("Сбросить масштаб на 100%", "Reset scale to 100%"))
-                            .clicked()
-                        {
-                            self.ui_scale = 1.0;
-                            ctx.set_pixels_per_point(self.ui_scale);
-                            settings_dirty = true;
-                        }
-                        if ui
-                            .small_button("A-")
-                            .on_hover_text(lang.tr("Уменьшить масштаб", "Zoom Out"))
-                            .clicked()
-                        {
-                            self.ui_scale = (self.ui_scale - 0.1).max(0.85);
-                            ctx.set_pixels_per_point(self.ui_scale);
-                            settings_dirty = true;
-                        }
-
-                        ui.separator();
-
-                        let theme_label = if self.dark_mode {
-                            lang.tr("🌙 Тёмная", "🌙 Dark")
+                if ui
+                    .button(lang.tr("☑ Инверт.", "☑ Invert"))
+                    .clicked()
+                {
+                    for row in &self.preview_rows {
+                        if self.excluded_paths.contains(&row.old_path) {
+                            self.excluded_paths.remove(&row.old_path);
                         } else {
-                            lang.tr("☀ Светлая", "☀ Light")
-                        };
-                        if ui.button(theme_label).clicked() {
-                            self.dark_mode = !self.dark_mode;
-                            apply_theme_and_style(ctx, self.dark_mode);
-                            settings_dirty = true;
-                        }
-                    });
-                });
-            } else {
-                // Адаптивный режим с автопереносом строк (без перекрытия при узком окне или крупном масштабе)
-                ui.horizontal_wrapped(|ui| {
-                    let (rect, _) =
-                        ui.allocate_exact_size(egui::vec2(24.0, 24.0), egui::Sense::hover());
-                    ui.painter()
-                        .rect_filled(rect, 6.0, egui::Color32::from_rgb(20, 30, 48));
-                    ui.painter().text(
-                        rect.center(),
-                        egui::Align2::CENTER_CENTER,
-                        "R",
-                        egui::FontId::proportional(16.0),
-                        egui::Color32::from_rgb(35, 205, 175),
-                    );
-                    ui.strong("ReStem");
-                    ui.weak(format!("v{}", APP_VERSION));
-                    ui.separator();
-
-                    if ui
-                        .button(lang.tr("📁 Папка...", "📁 Folder..."))
-                        .on_hover_text("Ctrl+O")
-                        .clicked()
-                    {
-                        if let Some(folder) = rfd::FileDialog::new().pick_folder() {
-                            navigate_to = Some(folder);
+                            self.excluded_paths.insert(row.old_path.clone());
                         }
                     }
+                    needs_recalc = true;
+                }
 
-                    if ui
-                        .button(lang.tr("🔄 Обновить", "🔄 Refresh"))
-                        .on_hover_text("F5")
-                        .clicked()
-                    {
-                        needs_reload = true;
+                if ui
+                    .button(lang.tr("🧬 Дубликаты", "🧬 Duplicates"))
+                    .on_hover_text(lang.tr(
+                        "Поиск точных копий файлов в папке",
+                        "Find exact duplicate files in folder",
+                    ))
+                    .clicked()
+                {
+                    self.show_duplicates_modal = true;
+                }
+
+                let top_apply_label = if self.issue_count > 0 {
+                    match lang {
+                        Lang::Ru => format!("⚠ Конфликты ({})", self.issue_count),
+                        Lang::En => format!("⚠ Issues ({})", self.issue_count),
                     }
-
-                    if ui
-                        .button(lang.tr("☑ Инверт.", "☑ Invert"))
-                        .clicked()
-                    {
-                        for row in &self.preview_rows {
-                            if self.excluded_paths.contains(&row.old_path) {
-                                self.excluded_paths.remove(&row.old_path);
-                            } else {
-                                self.excluded_paths.insert(row.old_path.clone());
-                            }
-                        }
-                        needs_recalc = true;
-                    }
-
-                    let top_apply_label = match lang {
+                } else {
+                    match lang {
                         Lang::Ru => format!("✔ Применить ({})", ready_to_rename_count),
                         Lang::En => format!("✔ Apply ({})", ready_to_rename_count),
-                    };
-                    let top_apply_fill = if ready_to_rename_count > 0 {
-                        egui::Color32::from_rgb(16, 148, 92)
-                    } else if is_dark {
-                        egui::Color32::from_rgb(42, 48, 60)
-                    } else {
-                        egui::Color32::from_rgb(210, 216, 226)
-                    };
-                    let top_apply_fg = if ready_to_rename_count > 0 {
-                        egui::Color32::WHITE
-                    } else if is_dark {
-                        egui::Color32::from_gray(160)
-                    } else {
-                        egui::Color32::from_gray(105)
-                    };
-                    let top_apply_btn = egui::Button::new(
-                        egui::RichText::new(top_apply_label)
-                            .color(top_apply_fg)
-                            .strong(),
+                    }
+                };
+                let top_apply_fill = if self.issue_count > 0 {
+                    egui::Color32::from_rgb(190, 60, 50)
+                } else if ready_to_rename_count > 0 {
+                    egui::Color32::from_rgb(16, 148, 92)
+                } else if is_dark {
+                    egui::Color32::from_rgb(42, 48, 60)
+                } else {
+                    egui::Color32::from_rgb(210, 216, 226)
+                };
+                let top_apply_fg = if can_apply_now || self.issue_count > 0 {
+                    egui::Color32::WHITE
+                } else if is_dark {
+                    egui::Color32::from_gray(160)
+                } else {
+                    egui::Color32::from_gray(105)
+                };
+                let top_apply_btn = egui::Button::new(
+                    egui::RichText::new(top_apply_label)
+                        .color(top_apply_fg)
+                        .strong(),
+                )
+                .fill(top_apply_fill);
+
+                if ui
+                    .add_enabled(can_apply_now, top_apply_btn)
+                    .on_hover_text("Ctrl+Enter")
+                    .clicked()
+                {
+                    trigger_apply = true;
+                }
+
+                let undo_label = match lang {
+                    Lang::Ru => format!("↺ Откат ({})", self.undo_stack.len()),
+                    Lang::En => format!("↺ Undo ({})", self.undo_stack.len()),
+                };
+                if ui
+                    .add_enabled(!self.undo_stack.is_empty(), egui::Button::new(undo_label))
+                    .on_hover_text("Ctrl+Z")
+                    .clicked()
+                {
+                    trigger_undo = true;
+                }
+
+                if ui
+                    .add_enabled(
+                        !self.undo_stack.is_empty(),
+                        egui::Button::new(lang.tr("💾 .bat", "💾 .bat")),
                     )
-                    .fill(top_apply_fill);
+                    .on_hover_text(lang.tr(
+                        "Экспортировать .bat-скрипт для отката",
+                        "Export .bat rollback script",
+                    ))
+                    .clicked()
+                {
+                    self.export_rollback_script();
+                }
 
-                    if ui
-                        .add_enabled(ready_to_rename_count > 0, top_apply_btn)
-                        .clicked()
-                    {
-                        trigger_apply = true;
-                    }
+                let trash_label = match lang {
+                    Lang::Ru => format!("🗑 В корзину ({})", checked_count),
+                    Lang::En => format!("🗑 Trash ({})", checked_count),
+                };
+                if ui
+                    .add_enabled(checked_count > 0, egui::Button::new(trash_label))
+                    .on_hover_text("Delete")
+                    .clicked()
+                {
+                    self.confirm_trash_modal = true;
+                }
 
-                    let undo_label = match lang {
-                        Lang::Ru => format!("↺ Откат ({})", self.undo_stack.len()),
-                        Lang::En => format!("↺ Undo ({})", self.undo_stack.len()),
-                    };
-                    if ui
-                        .add_enabled(!self.undo_stack.is_empty(), egui::Button::new(undo_label))
-                        .clicked()
-                    {
-                        trigger_undo = true;
-                    }
+                ui.separator();
 
-                    if ui
-                        .add_enabled(
-                            !self.undo_stack.is_empty(),
-                            egui::Button::new(lang.tr("💾 .bat", "💾 .bat")),
-                        )
-                        .clicked()
-                    {
-                        self.export_rollback_script();
-                    }
+                let theme_label = if self.dark_mode {
+                    lang.tr("🌙 Тёмная", "🌙 Dark")
+                } else {
+                    lang.tr("☀ Светлая", "☀ Light")
+                };
+                if ui.button(theme_label).clicked() {
+                    self.dark_mode = !self.dark_mode;
+                    apply_theme_and_style(ctx, self.dark_mode);
+                    settings_dirty = true;
+                }
 
-                    let trash_label = match lang {
-                        Lang::Ru => format!("🗑 В корзину ({})", checked_count),
-                        Lang::En => format!("🗑 Trash ({})", checked_count),
-                    };
-                    if ui
-                        .add_enabled(checked_count > 0, egui::Button::new(trash_label))
-                        .clicked()
-                    {
-                        self.confirm_trash_modal = true;
-                    }
+                if ui
+                    .small_button("A-")
+                    .on_hover_text(lang.tr("Уменьшить масштаб", "Zoom Out"))
+                    .clicked()
+                {
+                    self.ui_scale = (self.ui_scale - 0.1).max(0.85);
+                    ctx.set_pixels_per_point(self.ui_scale);
+                    settings_dirty = true;
+                }
+                if ui
+                    .small_button(format!("{:.0}%", self.ui_scale * 100.0))
+                    .on_hover_text(lang.tr("Сбросить масштаб на 100%", "Reset scale to 100%"))
+                    .clicked()
+                {
+                    self.ui_scale = 1.0;
+                    ctx.set_pixels_per_point(self.ui_scale);
+                    settings_dirty = true;
+                }
+                if ui
+                    .small_button("A+")
+                    .on_hover_text(lang.tr("Увеличить масштаб", "Zoom In"))
+                    .clicked()
+                {
+                    self.ui_scale = (self.ui_scale + 0.1).min(1.5);
+                    ctx.set_pixels_per_point(self.ui_scale);
+                    settings_dirty = true;
+                }
 
-                    ui.separator();
+                if ui.selectable_label(self.lang == Lang::Ru, "RU").clicked() {
+                    self.lang = Lang::Ru;
+                    settings_dirty = true;
+                    needs_recalc = true;
+                }
+                if ui.selectable_label(self.lang == Lang::En, "EN").clicked() {
+                    self.lang = Lang::En;
+                    settings_dirty = true;
+                    needs_recalc = true;
+                }
 
-                    let theme_label = if self.dark_mode {
-                        lang.tr("🌙 Тёмная", "🌙 Dark")
-                    } else {
-                        lang.tr("☀ Светлая", "☀ Light")
-                    };
-                    if ui.button(theme_label).clicked() {
-                        self.dark_mode = !self.dark_mode;
-                        apply_theme_and_style(ctx, self.dark_mode);
-                        settings_dirty = true;
-                    }
-
-                    if ui.small_button("A-").clicked() {
-                        self.ui_scale = (self.ui_scale - 0.1).max(0.85);
-                        ctx.set_pixels_per_point(self.ui_scale);
-                        settings_dirty = true;
-                    }
-                    if ui
-                        .small_button(format!("{:.0}%", self.ui_scale * 100.0))
-                        .clicked()
-                    {
-                        self.ui_scale = 1.0;
-                        ctx.set_pixels_per_point(self.ui_scale);
-                        settings_dirty = true;
-                    }
-                    if ui.small_button("A+").clicked() {
-                        self.ui_scale = (self.ui_scale + 0.1).min(1.5);
-                        ctx.set_pixels_per_point(self.ui_scale);
-                        settings_dirty = true;
-                    }
-
-                    if ui.selectable_label(self.lang == Lang::Ru, "RU").clicked() {
-                        self.lang = Lang::Ru;
-                        settings_dirty = true;
-                        needs_recalc = true;
-                    }
-                    if ui.selectable_label(self.lang == Lang::En, "EN").clicked() {
-                        self.lang = Lang::En;
-                        settings_dirty = true;
-                        needs_recalc = true;
-                    }
-
-                    if ui.button("🌐 GitHub").clicked() {
-                        open_url_in_browser(GITHUB_REPO_URL);
-                    }
-                    if ui
-                        .button(lang.tr("ℹ О программе", "ℹ About"))
-                        .clicked()
-                    {
-                        self.show_about_modal = true;
-                    }
-                });
-            }
+                if ui
+                    .button("🌐 GitHub")
+                    .on_hover_text(GITHUB_REPO_URL)
+                    .clicked()
+                {
+                    open_url_in_browser(GITHUB_REPO_URL);
+                }
+                if ui
+                    .button(lang.tr("ℹ О программе", "ℹ About"))
+                    .clicked()
+                {
+                    self.show_about_modal = true;
+                }
+            });
 
             ui.separator();
 
-            // Ряд 2: Поиск, фильтрация, Diff-режим и сортировка (с поддержкой автопереноса horizontal_wrapped)
+            // Ряд 2: Поиск, фильтрация, Diff-режим и сортировка
             ui.horizontal_wrapped(|ui| {
                 ui.label("🔍");
                 let search_hint = lang.tr("Поиск...", "Filter...");
@@ -3117,12 +2601,13 @@ impl eframe::App for ReStemApp {
 
                 ui.label(lang.tr("Показать:", "Show:"));
                 egui::ComboBox::from_id_salt("status_filter_cb")
-                    .width(135.0)
+                    .width(145.0)
                     .selected_text(match self.status_filter {
                         StatusFilter::All => lang.tr("Все объекты", "All items"),
                         StatusFilter::OnlyChanged => lang.tr("Только изменяемые", "Only changing"),
                         StatusFilter::OnlyIncluded => lang.tr("Только выбранные ☑", "Only checked ☑"),
                         StatusFilter::OnlyUnchanged => lang.tr("Без изменений", "Unchanged only"),
+                        StatusFilter::OnlyIssues => lang.tr("⚠ Конфликты / Ошибки", "⚠ Issues only"),
                     })
                     .show_ui(ui, |ui| {
                         needs_recalc |= ui
@@ -3151,6 +2636,13 @@ impl eframe::App for ReStemApp {
                                 &mut self.status_filter,
                                 StatusFilter::OnlyUnchanged,
                                 lang.tr("Без изменений", "Unchanged only"),
+                            )
+                            .changed();
+                        needs_recalc |= ui
+                            .selectable_value(
+                                &mut self.status_filter,
+                                StatusFilter::OnlyIssues,
+                                lang.tr("⚠ Конфликты / Ошибки", "⚠ Issues only"),
                             )
                             .changed();
                     });
@@ -3235,43 +2727,58 @@ impl eframe::App for ReStemApp {
             ui.add_space(3.0);
         });
 
-        // --- НИЖНЯЯ СТРОКА СОСТОЯНИЯ (БЕЗ ПЕРЕКРЫТИЯ ПУТИ И СЧЁТЧИКОВ) ---
+        // --- НИЖНЯЯ СТРОКА СОСТОЯНИЯ + ИНДИКАТОР СКАНИРОВАНИЯ ---
         egui::TopBottomPanel::bottom("status_footer").show(ctx, |ui| {
             ui.add_space(2.0);
-            let path_str = self
-                .current_dir
-                .as_ref()
-                .map(|p| p.display().to_string())
-                .unwrap_or_else(|| {
-                    lang.tr("Папка не выбрана", "No folder selected").to_string()
-                });
-
-            if ui.available_width() >= 900.0 {
-                ui.horizontal(|ui| {
-                    ui.strong(&self.status_msg);
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.add(egui::Label::new(path_str).truncate());
-                    });
+            if let Some(job) = &self.scan_job {
+                ui.horizontal_wrapped(|ui| {
+                    ui.spinner();
+                    ui.strong(format!(
+                        "{}: {} ({})",
+                        lang.tr("Сканирование", "Scanning"),
+                        job.scanned,
+                        job.current_name
+                    ));
+                    if ui.small_button(lang.tr("✖ Отмена", "✖ Cancel")).clicked() {
+                        job.cancel.store(true, Ordering::Relaxed);
+                    }
                 });
             } else {
-                ui.horizontal_wrapped(|ui| {
-                    ui.strong(&self.status_msg);
-                    ui.separator();
-                    ui.weak(path_str);
-                });
+                let path_str = self
+                    .current_dir
+                    .as_ref()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|| {
+                        lang.tr("Папка не выбрана", "No folder selected").to_string()
+                    });
+
+                if ui.available_width() >= 900.0 {
+                    ui.horizontal(|ui| {
+                        ui.strong(&self.status_msg);
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            ui.add(egui::Label::new(path_str).truncate());
+                        });
+                    });
+                } else {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.strong(&self.status_msg);
+                        ui.separator();
+                        ui.weak(path_str);
+                    });
+                }
             }
             ui.add_space(2.0);
         });
 
         let screen_w = ctx.screen_rect().width();
-        let left_max_w = (screen_w * 0.27).clamp(210.0, 380.0);
-        let right_max_w = (screen_w * 0.33).clamp(265.0, 440.0);
+        let left_max_w = (screen_w * 0.27).clamp(215.0, 390.0);
+        let right_max_w = (screen_w * 0.34).clamp(270.0, 460.0);
 
-        // --- ЛЕВАЯ КОЛОНКА: ПАПКИ, ПРЕДПРОСМОТР И СОХРАНЯЕМЫЕ ПРЕСЕТЫ ---
+        // --- ЛЕВАЯ КОЛОНКА ---
         egui::SidePanel::left("left_explorer_panel")
             .resizable(true)
-            .default_width(265.0)
-            .width_range(195.0..=left_max_w)
+            .default_width(275.0)
+            .width_range(200.0..=left_max_w)
             .show(ctx, |ui| {
                 egui::ScrollArea::vertical()
                     .id_salt("left_panel_main_scroll")
@@ -3312,7 +2819,7 @@ impl eframe::App for ReStemApp {
 
                             egui::ScrollArea::vertical()
                                 .id_salt("folders_sub_scroll")
-                                .max_height(135.0)
+                                .max_height(130.0)
                                 .show(ui, |ui| {
                                     for sub in &self.subfolders {
                                         let name = sub
@@ -3369,16 +2876,11 @@ impl eframe::App for ReStemApp {
                                 PreviewState::Image {
                                     name,
                                     texture,
-                                    orig_w,
-                                    orig_h,
-                                    exif_info,
+                                    meta,
                                     tex_size,
                                 } => {
                                     ui.strong(format!("🖼 {}", name));
-                                    ui.label(format!("{} × {} px", orig_w, orig_h));
-                                    if !exif_info.is_empty() {
-                                        ui.weak(exif_info);
-                                    }
+                                    render_photo_meta_lines(ui, meta, lang);
                                     let max_w = ui.available_width().max(80.0);
                                     let max_h = 175.0;
                                     let scale =
@@ -3396,12 +2898,50 @@ impl eframe::App for ReStemApp {
                                         egui::Color32::WHITE,
                                     );
                                 }
+                                PreviewState::PhotoMetaOnly {
+                                    name,
+                                    ext_upper,
+                                    meta,
+                                } => {
+                                    ui.strong(format!("📷 {}", name));
+                                    ui.weak(format!("{} (EXIF)", ext_upper));
+                                    render_photo_meta_lines(ui, meta, lang);
+                                }
                                 PreviewState::Video {
                                     name,
                                     info,
                                     size_bytes,
+                                    thumb,
+                                    loading_thumb,
                                 } => {
                                     ui.strong(format!("🎬 {}", name));
+                                    if let Some((tex, tex_size)) = thumb {
+                                        let max_w = ui.available_width().max(80.0);
+                                        let max_h = 155.0;
+                                        let scale = (max_w / tex_size.x)
+                                            .min(max_h / tex_size.y)
+                                            .min(1.0);
+                                        let draw_size = *tex_size * scale;
+                                        let (rect, _) =
+                                            ui.allocate_exact_size(draw_size, egui::Sense::hover());
+                                        ui.painter().image(
+                                            tex.id(),
+                                            rect,
+                                            egui::Rect::from_min_max(
+                                                egui::pos2(0.0, 0.0),
+                                                egui::pos2(1.0, 1.0),
+                                            ),
+                                            egui::Color32::WHITE,
+                                        );
+                                    } else if *loading_thumb {
+                                        ui.horizontal(|ui| {
+                                            ui.spinner();
+                                            ui.weak(lang.tr(
+                                                "Загрузка кадра (ffmpeg)...",
+                                                "Extracting video frame (ffmpeg)...",
+                                            ));
+                                        });
+                                    }
                                     if let Some((w, h)) = info.dimensions() {
                                         let res_lbl = info
                                             .resolution_label()
@@ -3473,6 +3013,78 @@ impl eframe::App for ReStemApp {
                                             "Метаданные не найдены. Для нестандартных форматов установите MediaInfo CLI или ffprobe в PATH.",
                                             "No metadata found. For uncommon formats, install MediaInfo CLI or ffprobe in PATH.",
                                         ));
+                                    }
+                                }
+                                PreviewState::Audio {
+                                    name,
+                                    info,
+                                    size_bytes,
+                                    cover,
+                                } => {
+                                    ui.strong(format!("🎵 {}", name));
+                                    if let Some((tex, tex_size)) = cover {
+                                        let max_w = ui.available_width().max(80.0);
+                                        let max_h = 150.0;
+                                        let scale = (max_w / tex_size.x)
+                                            .min(max_h / tex_size.y)
+                                            .min(1.0);
+                                        let draw_size = *tex_size * scale;
+                                        let (rect, _) =
+                                            ui.allocate_exact_size(draw_size, egui::Sense::hover());
+                                        ui.painter().image(
+                                            tex.id(),
+                                            rect,
+                                            egui::Rect::from_min_max(
+                                                egui::pos2(0.0, 0.0),
+                                                egui::pos2(1.0, 1.0),
+                                            ),
+                                            egui::Color32::WHITE,
+                                        );
+                                    }
+                                    if info.artist.is_some() || info.title.is_some() {
+                                        ui.label(format!(
+                                            "{} — {}",
+                                            info.artist.as_deref().unwrap_or("?"),
+                                            info.title.as_deref().unwrap_or("?")
+                                        ));
+                                    }
+                                    let mut alb_parts = Vec::new();
+                                    if let Some(al) = &info.album {
+                                        alb_parts.push(al.clone());
+                                    }
+                                    if let Some(y) = &info.year {
+                                        alb_parts.push(y.clone());
+                                    }
+                                    if let Some(tr) = info.track_tag() {
+                                        alb_parts.push(format!("#{}", tr));
+                                    }
+                                    if !alb_parts.is_empty() {
+                                        ui.weak(alb_parts.join("  •  "));
+                                    }
+                                    if let Some(g) = &info.genre {
+                                        ui.weak(format!(
+                                            "{}: {}",
+                                            lang.tr("Жанр", "Genre"),
+                                            g
+                                        ));
+                                    }
+                                    let mut tech = Vec::new();
+                                    if let Some(dur) = info.duration_display() {
+                                        tech.push(format!("⏱ {}", dur));
+                                    }
+                                    if let Some(br) = info.bitrate_tag() {
+                                        tech.push(br);
+                                    }
+                                    if let Some(sr) = info.sample_rate_tag() {
+                                        tech.push(sr);
+                                    }
+                                    if let Some(fmt) = &info.format {
+                                        tech.push(fmt.clone());
+                                    } else if *size_bytes > 0 {
+                                        tech.push(Self::format_size(*size_bytes, false));
+                                    }
+                                    if !tech.is_empty() {
+                                        ui.label(tech.join(" • "));
                                     }
                                 }
                                 PreviewState::Text {
@@ -3605,6 +3217,30 @@ impl eframe::App for ReStemApp {
                                 self.suffix = "_{res}_{acodec}".to_string();
                                 needs_recalc = true;
                             }
+                            if ui
+                                .button(lang.tr(
+                                    "• Музыка: {track}_{artist} - {title}",
+                                    "• Music: {track}_{artist} - {title}",
+                                ))
+                                .clicked()
+                            {
+                                self.find_str = ".*".to_string();
+                                self.replace_str = "{track}_{artist} - {title}".to_string();
+                                self.use_regex = true;
+                                needs_recalc = true;
+                            }
+                            if ui
+                                .button(lang.tr(
+                                    "• Фото по дате: {exif_date}/ + {exif_time}",
+                                    "• Organize photos: {exif_date}/ + {exif_time}",
+                                ))
+                                .clicked()
+                            {
+                                self.prefix = "{exif_date}_{exif_time}_".to_string();
+                                self.organize_enabled = true;
+                                self.organize_template = "{exif_date}".to_string();
+                                needs_recalc = true;
+                            }
 
                             if !self.user_presets.is_empty() {
                                 ui.separator();
@@ -3624,15 +3260,8 @@ impl eframe::App for ReStemApp {
                                 }
 
                                 if let Some(idx) = apply_idx {
-                                    let p = &self.user_presets[idx];
-                                    self.find_str = p.find_str.clone();
-                                    self.replace_str = p.replace_str.clone();
-                                    self.use_regex = p.use_regex;
-                                    self.prefix = p.prefix.clone();
-                                    self.suffix = p.suffix.clone();
-                                    self.translit_mode = p.translit_mode;
-                                    self.case_mode = p.case_mode;
-                                    self.sanitize_names = p.sanitize;
+                                    let preset = self.user_presets[idx].clone();
+                                    self.apply_full_preset(&preset);
                                     needs_recalc = true;
                                 }
                                 if let Some(idx) = remove_idx {
@@ -3653,33 +3282,50 @@ impl eframe::App for ReStemApp {
                                     .clicked()
                                     && !self.new_preset_title.trim().is_empty()
                                 {
-                                    self.user_presets.push(UserPreset {
-                                        title: self.new_preset_title.trim().to_string(),
-                                        find_str: self.find_str.clone(),
-                                        replace_str: self.replace_str.clone(),
-                                        use_regex: self.use_regex,
-                                        prefix: self.prefix.clone(),
-                                        suffix: self.suffix.clone(),
-                                        translit_mode: self.translit_mode,
-                                        case_mode: self.case_mode,
-                                        sanitize: self.sanitize_names,
-                                    });
+                                    let title = self.new_preset_title.trim().to_string();
+                                    let preset = self.capture_full_preset(title);
+                                    self.user_presets.push(preset);
                                     self.new_preset_title.clear();
                                     settings_dirty = true;
+                                }
+                            });
+                            ui.horizontal_wrapped(|ui| {
+                                if ui
+                                    .small_button(lang.tr("📤 Экспорт .json", "📤 Export .json"))
+                                    .clicked()
+                                {
+                                    self.export_presets_json_dialog();
+                                }
+                                if ui
+                                    .small_button(lang.tr("📥 Импорт .json", "📥 Import .json"))
+                                    .clicked()
+                                {
+                                    self.import_presets_json_dialog();
                                 }
                             });
                         });
                     });
             });
 
-        // --- ПРАВАЯ КОЛОНКА: ЗАКРЕПЛЁННЫЙ НИЖНИЙ ДОК + ПРОКРУЧИВАЕМЫЕ ПРАВИЛА ---
+        // --- ПРАВАЯ КОЛОНКА: ПРАВИЛА ---
         egui::SidePanel::right("right_rules_panel")
             .resizable(true)
-            .default_width(330.0)
-            .width_range(260.0..=right_max_w)
+            .default_width(345.0)
+            .width_range(265.0..=right_max_w)
             .show(ctx, |ui| {
-                // 1. Закреплённый нижний блок (Sticky Footer) — ВСЕГДА виден без прокрутки
-                let (dock_bg, dock_border) = if ready_to_rename_count > 0 {
+                let (dock_bg, dock_border) = if self.issue_count > 0 {
+                    if is_dark {
+                        (
+                            egui::Color32::from_rgb(55, 22, 24),
+                            egui::Color32::from_rgb(220, 75, 65),
+                        )
+                    } else {
+                        (
+                            egui::Color32::from_rgb(252, 232, 232),
+                            egui::Color32::from_rgb(205, 55, 45),
+                        )
+                    }
+                } else if ready_to_rename_count > 0 {
                     if is_dark {
                         (
                             egui::Color32::from_rgb(20, 38, 32),
@@ -3712,7 +3358,21 @@ impl eframe::App for ReStemApp {
                     .frame(sticky_frame)
                     .show_inside(ui, |ui| {
                         ui.horizontal_wrapped(|ui| {
-                            if ready_to_rename_count > 0 {
+                            if self.issue_count > 0 {
+                                ui.colored_label(
+                                    egui::Color32::from_rgb(235, 85, 75),
+                                    match lang {
+                                        Lang::Ru => format!(
+                                            "⚠ Конфликты / Ошибки: {} шт.",
+                                            self.issue_count
+                                        ),
+                                        Lang::En => format!(
+                                            "⚠ Conflicts / Issues: {}",
+                                            self.issue_count
+                                        ),
+                                    },
+                                );
+                            } else if ready_to_rename_count > 0 {
                                 let badge_col = if is_dark {
                                     egui::Color32::from_rgb(95, 235, 160)
                                 } else {
@@ -3740,10 +3400,6 @@ impl eframe::App for ReStemApp {
 
                             if ui
                                 .small_button(lang.tr("✖ Сброс правил", "✖ Reset Rules"))
-                                .on_hover_text(lang.tr(
-                                    "Сбросить все правила и фильтры",
-                                    "Reset all rules and filters",
-                                ))
                                 .clicked()
                             {
                                 trigger_reset = true;
@@ -3752,16 +3408,20 @@ impl eframe::App for ReStemApp {
 
                         ui.add_space(4.0);
 
-                        let main_btn_label = if ready_to_rename_count > 0 {
+                        let main_btn_label = if self.issue_count > 0 {
+                            lang.tr(
+                                "⚠ Исправьте конфликты или включите автосуффикс",
+                                "⚠ Resolve conflicts or enable auto-suffix",
+                            )
+                            .to_string()
+                        } else if ready_to_rename_count > 0 {
                             match lang {
-                                Lang::Ru => format!(
-                                    "✔ Применить изменения ({})",
-                                    ready_to_rename_count
-                                ),
-                                Lang::En => format!(
-                                    "✔ Apply Changes ({})",
-                                    ready_to_rename_count
-                                ),
+                                Lang::Ru => {
+                                    format!("✔ Применить изменения ({})", ready_to_rename_count)
+                                }
+                                Lang::En => {
+                                    format!("✔ Apply Changes ({})", ready_to_rename_count)
+                                }
                             }
                         } else {
                             lang.tr(
@@ -3771,34 +3431,29 @@ impl eframe::App for ReStemApp {
                             .to_string()
                         };
 
-                        let (btn_fill, btn_fg) = if ready_to_rename_count > 0 {
-                            (
-                                egui::Color32::from_rgb(16, 150, 92),
-                                egui::Color32::WHITE,
-                            )
+                        let btn_fill = if self.issue_count > 0 {
+                            egui::Color32::from_rgb(175, 55, 50)
+                        } else if ready_to_rename_count > 0 {
+                            egui::Color32::from_rgb(16, 150, 92)
                         } else {
-                            (
-                                egui::Color32::from_rgb(18, 118, 215),
-                                egui::Color32::WHITE,
-                            )
+                            egui::Color32::from_rgb(18, 118, 215)
                         };
 
                         let btn_text = egui::RichText::new(main_btn_label)
-                            .color(btn_fg)
+                            .color(egui::Color32::WHITE)
                             .strong()
-                            .size(15.0);
+                            .size(14.5);
 
                         let apply_btn = egui::Button::new(btn_text)
                             .fill(btn_fill)
                             .rounding(7.0)
                             .min_size(egui::vec2(ui.available_width(), 42.0));
 
-                        if ui.add(apply_btn).clicked() {
+                        if ui.add_enabled(can_apply_now, apply_btn).clicked() {
                             trigger_apply = true;
                         }
                     });
 
-                // 2. Заголовок правой панели
                 ui.add_space(4.0);
                 ui.horizontal_wrapped(|ui| {
                     ui.heading(lang.tr("Правила", "Rename Rules"));
@@ -3813,13 +3468,13 @@ impl eframe::App for ReStemApp {
                 });
                 ui.add_space(4.0);
 
-                // 3. Прокручиваемая область карточек правил
                 egui::ScrollArea::vertical()
                     .id_salt("rules_scroll")
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
                         let combo_w = (ui.available_width() - 24.0).max(160.0);
 
+                        // 1. Поиск и замена + доп. шаги
                         card_frame(is_dark).show(ui, |ui| {
                             ui.set_min_width(ui.available_width());
                             ui.horizontal_wrapped(|ui| {
@@ -3828,11 +3483,23 @@ impl eframe::App for ReStemApp {
                                     lang.tr("1. Поиск и замена", "1. Find & Replace"),
                                     is_dark,
                                 );
+                                if ui.small_button("[?] Regex").clicked() {
+                                    self.show_regex_help_modal = true;
+                                }
                                 if ui
-                                    .small_button(lang.tr("[?] Regex", "[?] Regex"))
+                                    .small_button(lang.tr("➕ Шаг", "➕ Step"))
+                                    .on_hover_text(lang.tr(
+                                        "Добавить дополнительный шаг замены",
+                                        "Add chained find/replace step",
+                                    ))
                                     .clicked()
                                 {
-                                    self.show_regex_help_modal = true;
+                                    self.extra_replaces.push(ReplaceStep {
+                                        find: String::new(),
+                                        replace: String::new(),
+                                        use_regex: false,
+                                        case_sensitive: true,
+                                    });
                                 }
                             });
                             ui.add_space(4.0);
@@ -3856,10 +3523,54 @@ impl eframe::App for ReStemApp {
                                     lang.tr("Учитывать регистр", "Case Sensitive"),
                                 )
                                 .changed();
+
+                            let mut rm_step: Option<usize> = None;
+                            for (idx, step) in self.extra_replaces.iter_mut().enumerate() {
+                                ui.separator();
+                                ui.push_id(format!("extra_rep_{}", idx), |ui| {
+                                    ui.horizontal(|ui| {
+                                        ui.weak(format!(
+                                            "{} #{}",
+                                            lang.tr("Шаг", "Step"),
+                                            idx + 2
+                                        ));
+                                        if ui.small_button("✖").clicked() {
+                                            rm_step = Some(idx);
+                                        }
+                                    });
+                                    needs_recalc |= ui
+                                        .add(
+                                            egui::TextEdit::singleline(&mut step.find)
+                                                .hint_text(lang.tr("Найти...", "Find...")),
+                                        )
+                                        .changed();
+                                    needs_recalc |= ui
+                                        .add(
+                                            egui::TextEdit::singleline(&mut step.replace)
+                                                .hint_text(lang.tr("Заменить на...", "Replace...")),
+                                        )
+                                        .changed();
+                                    ui.horizontal(|ui| {
+                                        needs_recalc |=
+                                            ui.checkbox(&mut step.use_regex, "Regex").changed();
+                                        needs_recalc |= ui
+                                            .checkbox(
+                                                &mut step.case_sensitive,
+                                                lang.tr("Регистр", "Case"),
+                                            )
+                                            .changed();
+                                    });
+                                });
+                            }
+                            if let Some(idx) = rm_step {
+                                self.extra_replaces.remove(idx);
+                                needs_recalc = true;
+                            }
                         });
 
                         ui.add_space(8.0);
 
+                        // 2. Регистр, транслит и чистка
                         card_frame(is_dark).show(ui, |ui| {
                             ui.set_min_width(ui.available_width());
                             section_title(
@@ -3933,12 +3644,14 @@ impl eframe::App for ReStemApp {
                                 .width(combo_w)
                                 .selected_text(match self.translit_mode {
                                     TranslitMode::None => lang.tr("Выключена", "Disabled"),
-                                    TranslitMode::RuToLat => {
-                                        lang.tr("Кириллица → Латиница (RU → LAT)", "Cyrillic → Latin (RU → LAT)")
-                                    }
-                                    TranslitMode::LatToRu => {
-                                        lang.tr("Латиница → Кириллица (LAT → RU)", "Latin → Cyrillic (LAT → RU)")
-                                    }
+                                    TranslitMode::RuToLat => lang.tr(
+                                        "Кириллица → Латиница (RU → LAT)",
+                                        "Cyrillic → Latin (RU → LAT)",
+                                    ),
+                                    TranslitMode::LatToRu => lang.tr(
+                                        "Латиница → Кириллица (LAT → RU)",
+                                        "Latin → Cyrillic (LAT → RU)",
+                                    ),
                                 })
                                 .show_ui(ui, |ui| {
                                     needs_recalc |= ui
@@ -3952,14 +3665,20 @@ impl eframe::App for ReStemApp {
                                         .selectable_value(
                                             &mut self.translit_mode,
                                             TranslitMode::RuToLat,
-                                            lang.tr("Кириллица → Латиница (RU → LAT)", "Cyrillic → Latin (RU → LAT)"),
+                                            lang.tr(
+                                                "Кириллица → Латиница (RU → LAT)",
+                                                "Cyrillic → Latin (RU → LAT)",
+                                            ),
                                         )
                                         .changed();
                                     needs_recalc |= ui
                                         .selectable_value(
                                             &mut self.translit_mode,
                                             TranslitMode::LatToRu,
-                                            lang.tr("Латиница → Кириллица (LAT → RU)", "Latin → Cyrillic (LAT → RU)"),
+                                            lang.tr(
+                                                "Латиница → Кириллица (LAT → RU)",
+                                                "Latin → Cyrillic (LAT → RU)",
+                                            ),
                                         )
                                         .changed();
                                 });
@@ -3978,6 +3697,7 @@ impl eframe::App for ReStemApp {
 
                         ui.add_space(8.0);
 
+                        // 3. Вставка, обрезка и Умные теги
                         card_frame(is_dark).show(ui, |ui| {
                             ui.set_min_width(ui.available_width());
                             section_title(
@@ -4035,39 +3755,47 @@ impl eframe::App for ReStemApp {
 
                             ui.add_space(4.0);
                             ui.weak(lang.tr(
-                                "Быстрая вставка тега в Префикс:",
-                                "Quick insert tag into Prefix:",
+                                "Фото EXIF, даты, размеры и хеши (в Префикс):",
+                                "Photo EXIF, dates, size & hashes (to Prefix):",
                             ));
                             ui.horizontal_wrapped(|ui| {
                                 for (tag, tip) in [
                                     (
                                         "{date}_",
-                                        lang.tr(
-                                            "Дата изменения (ГГГГ-ММ-ДД)",
-                                            "File modified date (YYYY-MM-DD)",
-                                        ),
+                                        lang.tr("Дата изменения файла", "Modified date"),
                                     ),
                                     (
                                         "{exif_date}_",
+                                        lang.tr("Дата съёмки фото EXIF", "EXIF capture date"),
+                                    ),
+                                    (
+                                        "{exif_time}_",
                                         lang.tr(
-                                            "Дата съёмки фото из EXIF",
-                                            "Photo capture date from EXIF",
+                                            "Время съёмки EXIF (ЧЧ-ММ-СС)",
+                                            "EXIF capture time (HH-MM-SS)",
                                         ),
                                     ),
                                     (
                                         "{camera}_",
-                                        lang.tr("Модель камеры из EXIF", "Camera model from EXIF"),
+                                        lang.tr("Модель камеры EXIF", "EXIF camera model"),
                                     ),
                                     (
-                                        "{parent}_",
-                                        lang.tr("Имя родительской папки", "Parent folder name"),
+                                        "{lens}_",
+                                        lang.tr("Модель объектива EXIF", "EXIF lens model"),
                                     ),
+                                    ("{iso}_", lang.tr("Чувствительность ISO", "EXIF ISO")),
+                                    ("{aperture}_", lang.tr("Диафрагма (f2.8)", "Aperture")),
+                                    ("{shutter}_", lang.tr("Выдержка (1-500s)", "Shutter speed")),
+                                    ("{parent}_", lang.tr("Родительская папка", "Parent folder")),
                                     (
                                         "{w}x{h}_",
-                                        lang.tr(
-                                            "Разрешение фото/видео (ШxВ)",
-                                            "Photo/Video dimensions (WxH)",
-                                        ),
+                                        lang.tr("Разрешение фото/видео", "Photo/Video dimensions"),
+                                    ),
+                                    ("{size}_", lang.tr("Размер файла (15MB)", "File size tag")),
+                                    ("{crc32}_", lang.tr("Контрольная сумма CRC32", "CRC32 hash")),
+                                    (
+                                        "{sha256_8}_",
+                                        lang.tr("Первые 8 симв. SHA-256", "First 8 chars of SHA-256"),
                                     ),
                                 ] {
                                     if ui.small_button(tag).on_hover_text(tip).clicked() {
@@ -4084,69 +3812,38 @@ impl eframe::App for ReStemApp {
                             ));
                             ui.horizontal_wrapped(|ui| {
                                 for (tag, tip) in [
-                                    (
-                                        "_{res}",
-                                        lang.tr(
-                                            "Качество видео: 1080p, 2160p, 720p",
-                                            "Video quality label: 1080p, 2160p, 720p",
-                                        ),
-                                    ),
-                                    (
-                                        "_{vcodec}",
-                                        lang.tr(
-                                            "Видеокодек: H264, HEVC, AV1, VP9",
-                                            "Video codec: H264, HEVC, AV1, VP9",
-                                        ),
-                                    ),
-                                    (
-                                        "_{fps}",
-                                        lang.tr(
-                                            "Частота кадров: 24fps, 60fps",
-                                            "Frame rate: 24fps, 60fps",
-                                        ),
-                                    ),
-                                    (
-                                        "_{acodec}",
-                                        lang.tr(
-                                            "Аудиокодек: AAC, AC3, Opus, DTS",
-                                            "Audio codec: AAC, AC3, Opus, DTS",
-                                        ),
-                                    ),
-                                    (
-                                        "_{ach}",
-                                        lang.tr(
-                                            "Каналы аудио: 2.0, 5.1, 7.1",
-                                            "Audio channels: 2.0, 5.1, 7.1",
-                                        ),
-                                    ),
-                                    (
-                                        "_{duration}",
-                                        lang.tr(
-                                            "Длительность: 04m35s, 01h20m10s",
-                                            "Duration: 04m35s, 01h20m10s",
-                                        ),
-                                    ),
-                                    (
-                                        "_{bitrate}",
-                                        lang.tr(
-                                            "Битрейт: 12Mbps, 850kbps",
-                                            "Bitrate: 12Mbps, 850kbps",
-                                        ),
-                                    ),
-                                    (
-                                        "_{hdr}",
-                                        lang.tr(
-                                            "Формат HDR: HDR10, HLG, DV",
-                                            "HDR format: HDR10, HLG, DV",
-                                        ),
-                                    ),
-                                    (
-                                        "_{media_date}",
-                                        lang.tr(
-                                            "Дата записи из метаданных видео (ГГГГ-ММ-ДД)",
-                                            "Video recorded date from metadata (YYYY-MM-DD)",
-                                        ),
-                                    ),
+                                    ("_{res}", lang.tr("Качество: 1080p, 2160p", "Quality tier")),
+                                    ("_{vcodec}", lang.tr("Видеокодек: H264, HEVC, AV1", "Video codec")),
+                                    ("_{fps}", lang.tr("Кадров/сек: 24fps, 60fps", "Frame rate")),
+                                    ("_{acodec}", lang.tr("Аудиокодек: AAC, AC3, Opus", "Audio codec")),
+                                    ("_{ach}", lang.tr("Каналы: 2.0, 5.1, 7.1", "Audio channels")),
+                                    ("_{duration}", lang.tr("Длительность (04m35s)", "Duration")),
+                                    ("_{bitrate}", lang.tr("Битрейт (12Mbps)", "Bitrate")),
+                                    ("_{hdr}", lang.tr("HDR-формат (HDR10, HLG, DV)", "HDR format")),
+                                    ("_{media_date}", lang.tr("Дата записи видео", "Video recorded date")),
+                                ] {
+                                    if ui.small_button(tag).on_hover_text(tip).clicked() {
+                                        self.suffix.push_str(tag);
+                                        needs_recalc = true;
+                                    }
+                                }
+                            });
+
+                            ui.add_space(4.0);
+                            ui.weak(lang.tr(
+                                "🎵 Аудио-теги (в Суффикс):",
+                                "🎵 Audio tags (to Suffix):",
+                            ));
+                            ui.horizontal_wrapped(|ui| {
+                                for (tag, tip) in [
+                                    ("_{track}", lang.tr("Номер трека (01, 02)", "Track number")),
+                                    ("_{artist}", lang.tr("Исполнитель", "Artist")),
+                                    ("_{title}", lang.tr("Название трека", "Track title")),
+                                    ("_{album}", lang.tr("Альбом", "Album")),
+                                    ("_{audio_year}", lang.tr("Год релиза", "Release year")),
+                                    ("_{genre}", lang.tr("Жанр", "Genre")),
+                                    ("_{audio_bitrate}", lang.tr("Битрейт аудио", "Audio bitrate")),
+                                    ("_{sample_rate}", lang.tr("Частота (44.1kHz)", "Sample rate")),
                                 ] {
                                     if ui.small_button(tag).on_hover_text(tip).clicked() {
                                         self.suffix.push_str(tag);
@@ -4158,6 +3855,7 @@ impl eframe::App for ReStemApp {
 
                         ui.add_space(8.0);
 
+                        // 4. Нумерация
                         card_frame(is_dark).show(ui, |ui| {
                             ui.set_min_width(ui.available_width());
                             section_title(
@@ -4249,6 +3947,7 @@ impl eframe::App for ReStemApp {
 
                         ui.add_space(8.0);
 
+                        // 5. Расширения файлов
                         card_frame(is_dark).show(ui, |ui| {
                             ui.set_min_width(ui.available_width());
                             section_title(
@@ -4257,8 +3956,6 @@ impl eframe::App for ReStemApp {
                                 is_dark,
                             );
                             ui.add_space(4.0);
-
-                            ui.label(lang.tr("Режим расширения:", "Extension mode:"));
                             egui::ComboBox::from_id_salt("ext_mode_cb")
                                 .width(combo_w)
                                 .selected_text(match self.ext_mode {
@@ -4313,6 +4010,7 @@ impl eframe::App for ReStemApp {
 
                         ui.add_space(8.0);
 
+                        // 6. Фильтры и исключения
                         card_frame(is_dark).show(ui, |ui| {
                             ui.set_min_width(ui.available_width());
                             section_title(
@@ -4416,6 +4114,118 @@ impl eframe::App for ReStemApp {
                                 });
                             }
                         });
+
+                        ui.add_space(8.0);
+
+                        // 7. Безопасность, парные файлы, раскладка и порядок правил
+                        card_frame(is_dark).show(ui, |ui| {
+                            ui.set_min_width(ui.available_width());
+                            section_title(
+                                ui,
+                                lang.tr(
+                                    "7. Безопасность, парные и раскладка",
+                                    "7. Safety, Sidecars & Organize",
+                                ),
+                                is_dark,
+                            );
+                            ui.add_space(4.0);
+
+                            needs_recalc |= ui
+                                .checkbox(
+                                    &mut self.auto_suffix_duplicates,
+                                    lang.tr(
+                                        "🔢 Автосуффикс при дубликатах (_1, _2)",
+                                        "🔢 Auto-suffix duplicate names (_1, _2)",
+                                    ),
+                                )
+                                .changed();
+
+                            needs_recalc |= ui
+                                .checkbox(
+                                    &mut self.sync_sidecars,
+                                    lang.tr(
+                                        "📎 Парные файлы (.srt, .ass, .vtt, .xmp)",
+                                        "📎 Sync sidecar files (.srt, .ass, .vtt, .xmp)",
+                                    ),
+                                )
+                                .changed();
+
+                            needs_recalc |= ui
+                                .checkbox(
+                                    &mut self.organize_enabled,
+                                    lang.tr(
+                                        "📂 Раскладка файлов по подпапкам",
+                                        "📂 Move files into subfolders (Organize)",
+                                    ),
+                                )
+                                .changed();
+
+                            if self.organize_enabled {
+                                ui.label(lang.tr("Шаблон подпапок:", "Subfolder template:"));
+                                needs_recalc |= ui
+                                    .add(
+                                        egui::TextEdit::singleline(&mut self.organize_template)
+                                            .hint_text("{year}/{month}"),
+                                    )
+                                    .changed();
+                                ui.horizontal_wrapped(|ui| {
+                                    for pat in [
+                                        "{year}/{month}",
+                                        "{exif_date}",
+                                        "{media_date}/{res}",
+                                        "{artist}/{album}",
+                                    ] {
+                                        if ui.small_button(pat).clicked() {
+                                            self.organize_template = pat.to_string();
+                                            needs_recalc = true;
+                                        }
+                                    }
+                                });
+                            }
+
+                            ui.add_space(4.0);
+                            ui.collapsing(
+                                lang.tr("⚙ Порядок этапов (Pipeline)", "⚙ Rule Pipeline Order"),
+                                |ui| {
+                                    let len = self.rule_order.len();
+                                    let mut swap_pair: Option<(usize, usize)> = None;
+                                    for i in 0..len {
+                                        let stage = self.rule_order[i];
+                                        ui.push_id(format!("pipe_stage_{}", i), |ui| {
+                                            ui.horizontal(|ui| {
+                                                ui.label(format!("{}. {}", i + 1, stage.label(lang)));
+                                                if ui
+                                                    .add_enabled(i > 0, egui::Button::new("▲").small())
+                                                    .clicked()
+                                                {
+                                                    swap_pair = Some((i, i - 1));
+                                                }
+                                                if ui
+                                                    .add_enabled(
+                                                        i + 1 < len,
+                                                        egui::Button::new("▼").small(),
+                                                    )
+                                                    .clicked()
+                                                {
+                                                    swap_pair = Some((i, i + 1));
+                                                }
+                                            });
+                                        });
+                                    }
+                                    if let Some((a, b)) = swap_pair {
+                                        self.rule_order.swap(a, b);
+                                        needs_recalc = true;
+                                    }
+                                    if ui
+                                        .small_button(lang.tr("↺ По умолчанию", "↺ Reset order"))
+                                        .clicked()
+                                    {
+                                        self.rule_order = default_rule_order();
+                                        needs_recalc = true;
+                                    }
+                                },
+                            );
+                        });
                         ui.add_space(6.0);
                     });
             });
@@ -4425,14 +4235,20 @@ impl eframe::App for ReStemApp {
             if settings_dirty {
                 self.save_settings();
             }
+            if trigger_update_check_now {
+                self.trigger_update_check(ctx);
+            }
+            if trigger_dup_scan {
+                self.start_duplicate_scan(ctx);
+            }
             if let Some(target) = single_trash_target.take() {
-                self.delete_paths_to_trash(vec![target]);
+                self.delete_paths_to_trash(vec![target], ctx);
             }
             if let Some(folder) = navigate_to.take() {
-                self.open_new_directory(folder);
+                self.open_new_directory(folder, ctx);
             } else if needs_reload {
                 if let Some(dir) = self.current_dir.clone() {
-                    self.load_directory(dir);
+                    self.load_directory(dir, ctx);
                 }
             } else if needs_recalc {
                 self.recalculate_preview();
@@ -4441,24 +4257,29 @@ impl eframe::App for ReStemApp {
             if trigger_reset {
                 self.reset_rules();
             }
-            if trigger_apply {
-                self.apply_rename();
+            if trigger_apply && can_apply_now {
+                self.apply_rename(ctx);
             }
             if trigger_undo {
-                self.undo_rename();
+                self.undo_rename(ctx);
             }
 
             ui.horizontal_wrapped(|ui| {
                 ui.heading(lang.tr("Файлы и папки для переименования", "Files to Rename"));
                 ui.weak(lang.tr(
-                    "• Клик — превью • Двойной клик — открыть • Шапка столбца — сортировка",
-                    "• Click to preview • Double-click to open • Column header to sort",
+                    "• Клик — превью • ✏ — правка строки • Двойной клик — открыть",
+                    "• Click to preview • ✏ edit row • Double-click to open",
                 ));
             });
             ui.add_space(4.0);
 
             let mut toggle_all: Option<bool> = None;
             let mut toggled_item: Option<(PathBuf, bool)> = None;
+            let mut start_inline_edit: Option<(PathBuf, String)> = None;
+            let mut commit_inline_edit: Option<(PathBuf, String)> = None;
+            let mut cancel_inline_edit = false;
+            let mut clear_manual_override: Option<PathBuf> = None;
+
             let all_included =
                 !self.preview_rows.is_empty() && self.preview_rows.iter().all(|r| r.included);
 
@@ -4493,10 +4314,14 @@ impl eframe::App for ReStemApp {
             let status_skipped = lang.tr("Пропущен", "Skipped");
             let label_folder = lang.tr("📁 Папка", "📁 Folder");
             let label_video = lang.tr("🎬 Видео", "🎬 Video");
+            let label_audio = lang.tr("🎵 Аудио", "🎵 Audio");
+            let label_sidecar = lang.tr("📎 Парный", "📎 Sidecar");
             let label_file = lang.tr("📄 Файл", "📄 File");
 
             let current_selected = self.selected_path.clone();
             let use_diff = self.inline_diff;
+            let editing_path_cur = self.editing_row_path.clone();
+            let mut editing_buf = self.editing_row_text.clone();
 
             card_frame(is_dark).show(ui, |ui| {
                 TableBuilder::new(ui)
@@ -4504,11 +4329,11 @@ impl eframe::App for ReStemApp {
                     .resizable(true)
                     .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
                     .column(Column::exact(34.0))
-                    .column(Column::initial(92.0).resizable(true))
-                    .column(Column::initial(220.0).resizable(true))
-                    .column(Column::initial(220.0).resizable(true))
-                    .column(Column::initial(90.0).resizable(true))
-                    .column(Column::initial(85.0).resizable(true))
+                    .column(Column::initial(95.0).resizable(true))
+                    .column(Column::initial(215.0).resizable(true))
+                    .column(Column::initial(250.0).resizable(true))
+                    .column(Column::initial(105.0).resizable(true))
+                    .column(Column::initial(80.0).resizable(true))
                     .column(Column::remainder())
                     .header(28.0, |mut header| {
                         header.col(|ui| {
@@ -4565,8 +4390,12 @@ impl eframe::App for ReStemApp {
                             row.col(|ui| {
                                 let kind_str = if item.is_dir {
                                     label_folder
+                                } else if item.is_sidecar {
+                                    label_sidecar
                                 } else if item.is_video {
                                     label_video
+                                } else if item.is_audio {
+                                    label_audio
                                 } else {
                                     label_file
                                 };
@@ -4586,6 +4415,20 @@ impl eframe::App for ReStemApp {
                                         egui::Color32::from_rgb(15, 105, 190)
                                     };
                                     ui.colored_label(video_col, kind_str);
+                                } else if item.is_audio {
+                                    let audio_col = if is_dark {
+                                        egui::Color32::from_rgb(195, 145, 255)
+                                    } else {
+                                        egui::Color32::from_rgb(125, 50, 190)
+                                    };
+                                    ui.colored_label(audio_col, kind_str);
+                                } else if item.is_sidecar {
+                                    let sc_col = if is_dark {
+                                        egui::Color32::from_rgb(120, 225, 180)
+                                    } else {
+                                        egui::Color32::from_rgb(20, 130, 90)
+                                    };
+                                    ui.colored_label(sc_col, kind_str);
                                 } else {
                                     ui.label(kind_str);
                                 }
@@ -4624,48 +4467,91 @@ impl eframe::App for ReStemApp {
                             });
 
                             row.col(|ui| {
-                                if !item.included {
-                                    ui.colored_label(muted, &item.old_name);
-                                } else if item.changed {
-                                    if use_diff {
-                                        let job = build_diff_layout_job(
-                                            &item.old_name,
-                                            &item.new_name,
-                                            true,
-                                            is_dark,
+                                if editing_path_cur.as_ref() == Some(&item.old_path) {
+                                    ui.horizontal(|ui| {
+                                        let ed = ui.add(
+                                            egui::TextEdit::singleline(&mut editing_buf)
+                                                .desired_width((ui.available_width() - 48.0).max(90.0)),
                                         );
-                                        ui.label(job);
-                                    } else {
-                                        let (bg_pill, fg_pill) = if is_dark {
-                                            (
-                                                egui::Color32::from_rgb(20, 82, 58),
-                                                egui::Color32::from_rgb(135, 250, 190),
-                                            )
-                                        } else {
-                                            (
-                                                egui::Color32::from_rgb(210, 245, 225),
-                                                egui::Color32::from_rgb(10, 95, 48),
-                                            )
-                                        };
-                                        egui::Frame::none()
-                                            .fill(bg_pill)
-                                            .rounding(5.0)
-                                            .inner_margin(egui::Margin::symmetric(7.0, 2.5))
-                                            .show(ui, |ui| {
-                                                ui.label(
-                                                    egui::RichText::new(&item.new_name)
-                                                        .color(fg_pill)
-                                                        .strong(),
-                                                );
-                                            });
-                                    }
+                                        if ed.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                                            commit_inline_edit = Some((item.old_path.clone(), editing_buf.clone()));
+                                        }
+                                        if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                                            cancel_inline_edit = true;
+                                        }
+                                        if ui.small_button("✔").clicked() {
+                                            commit_inline_edit = Some((item.old_path.clone(), editing_buf.clone()));
+                                        }
+                                        if ui.small_button("✖").clicked() {
+                                            cancel_inline_edit = true;
+                                        }
+                                    });
                                 } else {
-                                    ui.label(&item.new_name);
+                                    ui.horizontal(|ui| {
+                                        if !item.included {
+                                            ui.colored_label(muted, &item.old_name);
+                                        } else {
+                                            if self.organize_enabled
+                                                && item.target_rel_dir != item.rel_parent
+                                                && item.target_rel_dir != "."
+                                            {
+                                                ui.weak(format!("{}\\", item.target_rel_dir));
+                                            }
+                                            if item.issue != RowIssue::None {
+                                                ui.colored_label(
+                                                    egui::Color32::from_rgb(235, 80, 70),
+                                                    &item.new_name,
+                                                );
+                                            } else if item.changed {
+                                                if use_diff {
+                                                    let job = build_diff_layout_job(
+                                                        &item.old_name,
+                                                        &item.new_name,
+                                                        true,
+                                                        is_dark,
+                                                    );
+                                                    ui.label(job);
+                                                } else {
+                                                    ui.strong(&item.new_name);
+                                                }
+                                            } else {
+                                                ui.label(&item.new_name);
+                                            }
+
+                                            if ui
+                                                .small_button("✏")
+                                                .on_hover_text(lang.tr(
+                                                    "Редактировать новое имя вручную",
+                                                    "Edit new name manually",
+                                                ))
+                                                .clicked()
+                                            {
+                                                start_inline_edit =
+                                                    Some((item.old_path.clone(), item.new_name.clone()));
+                                            }
+                                            if item.has_manual_override
+                                                && ui
+                                                    .small_button("✖")
+                                                    .on_hover_text(lang.tr(
+                                                        "Сбросить ручную правку",
+                                                        "Clear manual override",
+                                                    ))
+                                                    .clicked()
+                                            {
+                                                clear_manual_override = Some(item.old_path.clone());
+                                            }
+                                        }
+                                    });
                                 }
                             });
 
                             row.col(|ui| {
-                                if !item.included {
+                                if item.issue != RowIssue::None {
+                                    ui.colored_label(
+                                        egui::Color32::from_rgb(235, 80, 70),
+                                        egui::RichText::new(item.issue.label(lang)).strong(),
+                                    );
+                                } else if !item.included {
                                     ui.colored_label(muted, status_skipped);
                                 } else if item.changed {
                                     let ch_col = if is_dark {
@@ -4694,6 +4580,28 @@ impl eframe::App for ReStemApp {
                     });
             });
 
+            if editing_path_cur.is_some() {
+                self.editing_row_text = editing_buf;
+            }
+            if let Some((p, txt)) = start_inline_edit {
+                self.editing_row_path = Some(p);
+                self.editing_row_text = txt;
+            } else if let Some((p, txt)) = commit_inline_edit {
+                self.editing_row_path = None;
+                let clean = txt.trim().to_string();
+                if !clean.is_empty() {
+                    self.manual_overrides.insert(p, clean);
+                } else {
+                    self.manual_overrides.remove(&p);
+                }
+                self.recalculate_preview();
+            } else if cancel_inline_edit {
+                self.editing_row_path = None;
+            } else if let Some(p) = clear_manual_override {
+                self.manual_overrides.remove(&p);
+                self.recalculate_preview();
+            }
+
             if let Some(target) = open_sys_target.take() {
                 open_in_system(&target);
             }
@@ -4721,78 +4629,5 @@ impl eframe::App for ReStemApp {
                 self.recalculate_preview();
             }
         });
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_video_smart_tags_expansion_and_rename() {
-        let mut app = ReStemApp::default();
-        app.prefix = "{media_date}_".to_string();
-        app.suffix = "_{res}_{vcodec}_{fps}_{acodec}_{ach}_{duration}_{bitrate}_{hdr}".to_string();
-
-        let video_entry = FsEntry {
-            path: PathBuf::from("Movie.mkv"),
-            parent_dir: PathBuf::from("."),
-            parent_name: "Movies".to_string(),
-            rel_parent: ".".to_string(),
-            name: "Movie.mkv".to_string(),
-            ext_lower: "mkv".to_string(),
-            is_dir: false,
-            is_hidden: false,
-            depth: 0,
-            size: 1_500_000_000,
-            modified_ts: 1_700_000_000,
-            img_dims: None,
-            exif_date: None,
-            exif_camera: None,
-            video_info: Some(media_info::VideoMediaInfo {
-                width: Some(3840),
-                height: Some(2160),
-                duration_secs: Some(3725.0),
-                fps: Some(23.976),
-                video_codec: Some("HEVC".to_string()),
-                audio_codec: Some("AC3".to_string()),
-                audio_channels: Some(6),
-                bitrate_bps: Some(15_400_000),
-                recorded_date: Some("2026-11-23".to_string()),
-                hdr: Some("HDR10".to_string()),
-                container: Some("MKV".to_string()),
-                source: media_info::MediaInfoSource::BuiltIn,
-            }),
-        };
-
-        assert_eq!(
-            app.compute_new_name(&video_entry, 0, None),
-            "2026-11-23_Movie_2160p_HEVC_23.98fps_AC3_5.1_01h02m05s_15Mbps_HDR10.mkv"
-        );
-        assert_eq!(app.expand_smart_tags("{w}x{h}", &video_entry), "3840x2160");
-
-        let plain_entry = FsEntry {
-            path: PathBuf::from("notes.txt"),
-            parent_dir: PathBuf::from("."),
-            parent_name: "Docs".to_string(),
-            rel_parent: ".".to_string(),
-            name: "notes.txt".to_string(),
-            ext_lower: "txt".to_string(),
-            is_dir: false,
-            is_hidden: false,
-            depth: 0,
-            size: 120,
-            modified_ts: 1_795_392_000, // 2026-11-23 UTC
-            img_dims: None,
-            exif_date: None,
-            exif_camera: None,
-            video_info: None,
-        };
-
-        assert_eq!(
-            app.expand_smart_tags("{res}|{vcodec}|{acodec}|{fps}|{duration}|{hdr}", &plain_entry),
-            "|||||"
-        );
-        assert_eq!(app.expand_smart_tags("{media_date}", &plain_entry), "2026-11-23");
     }
 }

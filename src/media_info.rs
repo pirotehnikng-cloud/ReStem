@@ -1702,6 +1702,7 @@ enum ExternalTool {
 }
 
 static DETECTED_EXTERNAL_TOOL: OnceLock<Option<ExternalTool>> = OnceLock::new();
+static DETECTED_FFMPEG: OnceLock<Option<PathBuf>> = OnceLock::new();
 
 fn find_in_path(names: &[&str]) -> Option<PathBuf> {
     let path_var = env::var_os("PATH")?;
@@ -1730,7 +1731,17 @@ fn get_external_tool() -> Option<&'static ExternalTool> {
         .as_ref()
 }
 
-fn run_hidden_command(mut cmd: Command) -> Option<String> {
+fn get_ffmpeg() -> Option<&'static PathBuf> {
+    DETECTED_FFMPEG
+        .get_or_init(|| find_in_path(&["ffmpeg.exe", "ffmpeg"]))
+        .as_ref()
+}
+
+pub fn has_ffmpeg() -> bool {
+    get_ffmpeg().is_some()
+}
+
+fn run_hidden_bytes(mut cmd: Command) -> Option<Vec<u8>> {
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
@@ -1740,7 +1751,52 @@ fn run_hidden_command(mut cmd: Command) -> Option<String> {
     if !output.status.success() {
         return None;
     }
-    Some(String::from_utf8_lossy(&output.stdout).to_string())
+    Some(output.stdout)
+}
+
+fn run_hidden_command(cmd: Command) -> Option<String> {
+    let bytes = run_hidden_bytes(cmd)?;
+    Some(String::from_utf8_lossy(&bytes).to_string())
+}
+
+pub fn extract_video_thumbnail_png(path: &Path, duration_secs: Option<f64>) -> Option<Vec<u8>> {
+    let bin = get_ffmpeg()?;
+    let primary_ts = if duration_secs.map(|d| d >= 3.0).unwrap_or(false) {
+        "00:00:01"
+    } else {
+        "00:00:00"
+    };
+
+    let run_at = |ts: &str| -> Option<Vec<u8>> {
+        let mut cmd = Command::new(bin);
+        cmd.args(["-v", "error", "-ss", ts, "-i"]);
+        cmd.arg(path);
+        cmd.args([
+            "-frames:v",
+            "1",
+            "-vf",
+            "scale=320:-1",
+            "-f",
+            "image2pipe",
+            "-vcodec",
+            "png",
+            "pipe:1",
+        ]);
+        let bytes = run_hidden_bytes(cmd)?;
+        if bytes.starts_with(b"\x89PNG") {
+            Some(bytes)
+        } else {
+            None
+        }
+    };
+
+    run_at(primary_ts).or_else(|| {
+        if primary_ts != "00:00:00" {
+            run_at("00:00:00")
+        } else {
+            None
+        }
+    })
 }
 
 fn query_external_mediainfo(path: &Path) -> Option<VideoMediaInfo> {
