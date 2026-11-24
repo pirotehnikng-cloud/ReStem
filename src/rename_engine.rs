@@ -1899,9 +1899,11 @@ mod tests {
         let excl = HashSet::new();
         let ov = HashMap::new();
         let summary = compute_preview(Some(&dir), &[vid.clone(), srt.clone()], &excl, &ov, &cfg, &mut cache);
-        assert_eq!(summary.rows[0].new_name, "Vacation.mkv");
-        assert_eq!(summary.rows[1].new_name, "Vacation.en.srt");
-        assert!(summary.rows[1].is_sidecar);
+        let mkv_row = summary.rows.iter().find(|r| r.old_name == "clip.mkv").unwrap();
+        let srt_row = summary.rows.iter().find(|r| r.old_name == "clip.en.srt").unwrap();
+        assert_eq!(mkv_row.new_name, "Vacation.mkv");
+        assert_eq!(srt_row.new_name, "Vacation.en.srt");
+        assert!(srt_row.is_sidecar);
 
         // Check collision detection vs auto-suffix
         let mut cfg2 = RenameConfig::from(&FullPreset::default());
